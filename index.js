@@ -33,17 +33,11 @@ const CHANNEL = cleanEnv(process.env.TELEGRAM_CHANNEL);
 const PORT = process.env.PORT || 3000;
 const CACHE_FILE = path.join(__dirname, 'tracks_cache.json');
 
-// GramJS StringSession requires the session to start with version "1"
+// GramJS StringSession requires the session string to begin with the version character "1"
 if (SESSION_STRING && SESSION_STRING[0] !== '1') {
-  if (SESSION_STRING.startsWith('BQANOT')) {
-    console.log("[AutoFix] Adding missing leading '1' to TELEGRAM_SESSION_STRING");
-    SESSION_STRING = '1' + SESSION_STRING;
-  } else {
-    const oneIdx = SESSION_STRING.indexOf('1');
-    if (oneIdx !== -1) {
-      console.log(`[AutoFix] Trimming leading characters before '1' in session string`);
-      SESSION_STRING = SESSION_STRING.slice(oneIdx);
-    }
+  const oneIdx = SESSION_STRING.indexOf('1');
+  if (oneIdx !== -1) {
+    SESSION_STRING = SESSION_STRING.slice(oneIdx);
   }
 }
 
@@ -598,7 +592,7 @@ function findTrack(id) {
 app.get('/manifest.json', (req, res) => {
   res.json({
     id: 'com.personal.telegrammusic',
-    name: 'Telegram Music',
+    name: 'Telegram Music Addon',
     version: '1.9.0',
     description: 'Personal hi-res, lossless, and high-quality music library streamed directly from Telegram',
     resources: ['search', 'stream'],
