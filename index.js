@@ -459,7 +459,10 @@ function isDuplicate(a, b) {
   return false;
 }
 
-// ── 30-Minute Digest & 12-Hour Auto-Delete Notifications ──────────────────────
+// ── Silent Deduplication & Optional Notifications ───────────────────────────
+// By default, duplicate cleanup and quality upgrades are 100% silent (no spam in channel).
+// Set ENABLE_CHANNEL_NOTIFICATIONS=true in .env / Render if you want digest messages posted.
+const ENABLE_CHANNEL_NOTIFICATIONS = process.env.ENABLE_CHANNEL_NOTIFICATIONS === 'true';
 
 const NOTIF_STATE_FILE = path.join(__dirname, 'notification_state.json');
 const DIGEST_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
@@ -530,6 +533,17 @@ async function flushDigestNotifications() {
 
   // 1. Purge expired digest messages (> 12 hours old) from Telegram channel
   await cleanupExpiredDigests();
+
+  // If notifications are disabled (silent mode), keep library clean without posting to channel
+  if (!ENABLE_CHANNEL_NOTIFICATIONS) {
+    const cleared = notifState.pending.length;
+    if (cleared > 0) {
+      console.log(`[Silent Mode] Cleared ${cleared} duplicate notification(s) without posting to channel.`);
+      notifState.pending = [];
+      saveNotificationState();
+    }
+    return { sent: false, reason: 'Channel notifications disabled (silent mode)', cleared };
+  }
 
   // 2. If no pending notifications, nothing to send
   if (notifState.pending.length === 0) {
@@ -796,6 +810,8 @@ app.get('/notifications/status', (req, res) => {
   const nextDueMs = Math.max(0, DIGEST_INTERVAL_MS - (now - notifState.lastDigestSent));
   res.json({
     status: 'ok',
+    channelNotificationsEnabled: ENABLE_CHANNEL_NOTIFICATIONS,
+    mode: ENABLE_CHANNEL_NOTIFICATIONS ? 'active' : 'silent',
     pendingCount: notifState.pending.length,
     pending: notifState.pending,
     sentDigestsCount: notifState.sentDigests.length,
