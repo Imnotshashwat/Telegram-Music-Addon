@@ -54,13 +54,14 @@ Follow the prompts to enter:
 The script writes your credentials to `.env`.
 
 ## 3. Set up your Telegram channel
-
-1. Create a channel in Telegram (private or public).
-2. Get the channel ID:
-   * **Public channel:** Use the username (e.g. `@my_lossless_vault`).
-   * **Private channel:** Forward any message from the channel to `@userinfobot` or `@getidsbot` to get the `-100...` numeric ID.
+ 
+1. Create a channel in Telegram and select **Private Channel** (do NOT create a public channel with a `@handle`).
+   * **Why Private:** Public channels are indexed by web search engines and scanned by automated record label copyright bots (IFPI, Sony, T-Series), which can lead to copyright infringement takedowns and channel bans. Private channels are not indexed and remain secure for personal cloud storage.
+2. Get the numeric channel ID:
+   * Forward any message from your private channel to `@userinfobot` or `@getidsbot` to retrieve the numeric ID (starts with `-100...`, e.g. `-1001234567890`).
 3. Upload audio files:
    * Always upload audio as **Files / Documents** rather than compressed audio. Telegram compresses standard music uploads, which strips FLAC quality and tags.
+   * You can add `/keep` or `#keep` in the upload caption to exempt a track from duplicate removal.
    * The server automatically indexes new files as soon as they appear in the channel.
 
 ## 4. Run locally

@@ -10,7 +10,14 @@ const { StringSession } = require('telegram/sessions');
 const { Api } = require('telegram/tl');
 const { NewMessage } = require('telegram/events');
 const mm = require('music-metadata');
-const { handleSongCommand } = require('./downloader');
+const {
+  handleSongCommand,
+  hasActivePicker,
+  handlePickerChoice,
+  cancelPicker,
+  switchPickerPage,
+  switchPickerEngine,
+} = require('./downloader');
 
 const app = express();
 app.set('trust proxy', true);
@@ -63,6 +70,20 @@ const EXT_TO_FORMAT = {
   opus: 'opus',
   alac: 'alac',
 };
+
+function isAudioDocument(doc) {
+  if (!doc) return false;
+  const mime = (doc.mimeType || '').toLowerCase();
+  const fileNameAttr = doc.attributes?.find((a) => a.className === 'DocumentAttributeFilename');
+  const fileName = fileNameAttr?.fileName || '';
+  const ext = fileName.split('.').pop()?.toLowerCase() || '';
+
+  const isAudioMime = mime.startsWith('audio/') || mime === 'application/ogg' || mime === 'application/x-flac';
+  const isAudioExt = AUDIO_EXTENSIONS.includes(ext);
+  const isAudioAttr = doc.attributes?.some((a) => a.className === 'DocumentAttributeAudio');
+
+  return Boolean(isAudioMime || isAudioExt || isAudioAttr);
+}
 
 // Known composer duos that are hyphenated in FLAC tags but separated with & or comma on YouTube Music / BitChord
 const COMPOSER_DUOS = [
@@ -340,6 +361,9 @@ async function parseTrackMessage(msg) {
     qualityText = `${formatName.toUpperCase()} (${Math.min(rawKbps || 320, 320)}kbps)`;
   }
 
+  const msgText = (msg.message || msg.text || '').toLowerCase();
+  const keep = msgText.includes('/keep') || msgText.includes('/ig') || msgText.includes('#keep');
+
   return {
     id: String(msg.id),
     title: title || fallbackTitle,
@@ -354,6 +378,7 @@ async function parseTrackMessage(msg) {
     hasArtwork,
     sizeBytes,
     mimeType: doc.mimeType || 'audio/mpeg',
+    keep: keep ? true : undefined,
   };
 }
 
@@ -630,7 +655,15 @@ async function deleteTelegramMessage(messageId) {
 }
 
 async function processTrackUpload(newTrack) {
-  const existingDup = trackIndex.find((t) => isDuplicate(t, newTrack));
+  // If track is explicitly flagged to keep, index it and skip duplicate deletion
+  if (newTrack.keep) {
+    trackIndex.unshift(newTrack);
+    saveCache();
+    console.log(`[Keep Flag] Track "${newTrack.title}" marked with /keep. Preserving without deduplication.`);
+    return newTrack;
+  }
+
+  const existingDup = trackIndex.find((t) => !t.keep && isDuplicate(t, newTrack));
   if (!existingDup) {
     trackIndex.unshift(newTrack);
     saveCache();
@@ -695,7 +728,13 @@ async function deduplicateEntireLibrary() {
   const kept = [];
 
   for (const track of sorted) {
-    const dup = kept.find((k) => isDuplicate(k, track));
+    // Never auto-delete tracks flagged with keep
+    if (track.keep) {
+      kept.push(track);
+      continue;
+    }
+
+    const dup = kept.find((k) => !k.keep && isDuplicate(k, track));
     if (!dup) {
       kept.push(track);
     } else {
@@ -1328,6 +1367,47 @@ async function resolveChannel() {
   return await client.getEntity(cleanInput);
 }
 
+async function startBotCallbackPoller(botToken) {
+  let offset = 0;
+  console.log('[Bot Poller] Active for real inline buttons.');
+  while (true) {
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${botToken}/getUpdates?offset=${offset}&timeout=25&allowed_updates=["callback_query"]`);
+      const data = await res.json();
+      if (data.ok && data.result) {
+        for (const update of data.result) {
+          offset = update.update_id + 1;
+          const cq = update.callback_query;
+          if (!cq || !cq.data) continue;
+
+          fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ callback_query_id: cq.id })
+          }).catch(() => {});
+
+          if (cq.data === 'cancel') {
+            await cancelPicker(client, channelEntity);
+          } else if (cq.data === 'page_1') {
+            await switchPickerPage(client, channelEntity, 1);
+          } else if (cq.data === 'page_2') {
+            await switchPickerPage(client, channelEntity, 2);
+          } else if (cq.data === 'switch_engine') {
+            await switchPickerEngine(client, channelEntity);
+          } else {
+            const opt = parseInt(cq.data, 10);
+            if (!isNaN(opt) && opt >= 1 && opt <= 10) {
+              await handlePickerChoice(client, channelEntity, opt, onTrackForwarded);
+            }
+          }
+        }
+      }
+    } catch (_) {
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+  }
+}
+
 (async () => {
   try {
     loadCache();
@@ -1339,7 +1419,12 @@ async function resolveChannel() {
     channelEntity = await resolveChannel();
     console.log(`Using Telegram channel: ${channelEntity.title || channelEntity.username || CHANNEL}`);
 
-    // Set up real-time listener for /song commands and new audio uploads
+    const BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+    if (BOT_TOKEN) {
+      startBotCallbackPoller(BOT_TOKEN);
+    }
+
+    // Set up real-time listener for /song commands, picker choices, audio uploads, and auto-purge cleaner
     client.addEventHandler(async (event) => {
       try {
         const message = event.message;
@@ -1347,26 +1432,85 @@ async function resolveChannel() {
 
         const isMusicChannel = channelEntity && message.peerId && (utils.getPeerId(message.peerId).toString() === utils.getPeerId(channelEntity).toString());
         const isSelfChat = message.isPrivate; // e.g. Saved Messages
+        const trimmedText = (message.text || message.message || '').trim();
 
-        // Check for /song command
-        if (message.text && message.text.trim().startsWith('/song')) {
+        // 1. Check for /song command
+        if (trimmedText.startsWith('/song')) {
           if (isMusicChannel || isSelfChat) {
-            console.log(`[Song Command] Detected: "${message.text.trim()}" (msg ID: ${message.id})`);
-            handleSongCommand(client, channelEntity, message.text.trim(), message.id, onTrackForwarded).catch((err) => {
+            console.log(`[Song Command] Detected: "${trimmedText}" (msg ID: ${message.id})`);
+            handleSongCommand(client, channelEntity, trimmedText, message.id, onTrackForwarded).catch((err) => {
               console.error('[Song Command Error]:', err.message);
             });
             return;
           }
         }
 
-        // Check for incoming audio file upload
-        if (message.media && message.media.document) {
+        // 2. Check for interactive picker choice (/1 to /10)
+        const pickerMatch = trimmedText.match(/^\/(10|[1-9])$/);
+        if (pickerMatch && hasActivePicker(channelEntity)) {
+          if (isMusicChannel || isSelfChat) {
+            const choice = parseInt(pickerMatch[1], 10);
+            client.deleteMessages(channelEntity, [message.id], { revoke: true }).catch(() => {});
+            handlePickerChoice(client, channelEntity, choice, onTrackForwarded).catch((err) => {
+              console.error('[Picker Choice Error]:', err.message);
+            });
+            return;
+          }
+        }
+
+        // 3. Check for /next, /prev, /switch navigation commands
+        if ((trimmedText === '/next' || trimmedText === '/more') && hasActivePicker(channelEntity)) {
+          if (isMusicChannel || isSelfChat) {
+            client.deleteMessages(channelEntity, [message.id], { revoke: true }).catch(() => {});
+            switchPickerPage(client, channelEntity, 2).catch(() => {});
+            return;
+          }
+        }
+
+        if (trimmedText === '/prev' && hasActivePicker(channelEntity)) {
+          if (isMusicChannel || isSelfChat) {
+            client.deleteMessages(channelEntity, [message.id], { revoke: true }).catch(() => {});
+            switchPickerPage(client, channelEntity, 1).catch(() => {});
+            return;
+          }
+        }
+
+        if ((trimmedText === '/switch' || trimmedText === '/engine') && hasActivePicker(channelEntity)) {
+          if (isMusicChannel || isSelfChat) {
+            client.deleteMessages(channelEntity, [message.id], { revoke: true }).catch(() => {});
+            switchPickerEngine(client, channelEntity).catch(() => {});
+            return;
+          }
+        }
+
+        // 4. Check for /cancel command
+        if (trimmedText === '/cancel' && hasActivePicker(channelEntity)) {
+          if (isMusicChannel || isSelfChat) {
+            client.deleteMessages(channelEntity, [message.id], { revoke: true }).catch(() => {});
+            cancelPicker(client, channelEntity).catch(() => {});
+            return;
+          }
+        }
+
+        // 4. Check for incoming audio file upload
+        const doc = message.media?.document;
+        if (doc && isAudioDocument(doc)) {
           if (!isMusicChannel) return;
 
-          console.log(`Detected new upload in channel (msg ID: ${message.id}), processing track...`);
+          console.log(`Detected new audio upload in channel (msg ID: ${message.id}), processing track...`);
           const track = await parseTrackMessage(message);
           if (track) {
             await processTrackUpload(track);
+          }
+          return;
+        }
+
+        // 5. Auto-purge channel cleaner: delete any incoming non-music messages from users
+        if (isMusicChannel && !message.out) {
+          const isCommand = trimmedText.startsWith('/');
+          if (!isCommand) {
+            console.log(`[Channel Cleaner] Auto-purging non-music message (msg ID: ${message.id})`);
+            client.deleteMessages(channelEntity, [message.id], { revoke: true }).catch(() => {});
           }
         }
       } catch (err) {

@@ -10,12 +10,44 @@ BitChord searches this server whenever a track is requested. If the track is pre
 - **In-memory indexing**: Maintains track metadata in memory to keep search latency under 5ms.
 - **Title and artist matching**: Normalizes song titles and splits multi-artist tags to match queries from YouTube Music.
 - **Quality deduplication**: Keeps track of bit depth, sample rate, and container formats, silently retaining higher-quality copies when duplicates are added without cluttering the channel.
-- **Automated bot downloads**: Includes a `/song` command to fetch tracks via Apple Music and music downloader bots directly into your channel.
-- **Silent operation**: Automatic cleanup and quality upgrades happen 100% silently in the background with zero channel spam.
+- **`/keep` protection flag**: Add `/keep` or `#keep` in an audio caption to bypass deduplication and preserve multiple editions or cuts of the same song.
+- **Interactive 5-option song search**: Type `/song <name>` in your channel to browse the top 5 results from downloader bots, then tap `/1` through `/5` to download directly in lossless FLAC.
+- **Automatic channel cleaner**: Auto-purges incoming text chat, photos, stickers, and spam from the channel while keeping audio files and slash commands.
+- **Silent operation**: Automatic cleanup and quality upgrades happen silently in the background with zero channel spam.
+
+## Why Telegram instead of Google Drive
+
+Using Telegram channels as a cloud music vault offers distinct advantages over Google Drive for personal streaming:
+
+- **Uncapped storage for free**: Google Drive limits free accounts to 15 GB total across Drive, Gmail, and Google Photos. Lossless CD and 24-bit Hi-Res FLAC tracks typically run 30 MB to 100 MB each, meaning a 15 GB tier fills up in roughly 200 to 300 songs. Telegram provides free cloud storage across channels with no total account cap, letting you store thousands of FLAC tracks without monthly subscription fees. Individual files can be up to 2 GB (4 GB with Telegram Premium).
+- **No daily download quotas or 24-hour bans**: Google Drive regularly flags frequent streaming and seeking with "Download quota exceeded for this file", locking playback for up to 24 hours. Telegram MTProto imposes no daily download quotas on your personal channel files.
+- **Low-latency byte-range streaming (RFC 7233)**: Telegram's MTProto protocol allows pulling exact 64KB to 512KB slices on demand (`client.iterDownload`). This gives Android ExoPlayer instant seeking response without the overhead of OAuth2 token refreshes and REST redirects.
+- **Direct in-chat bot automation**: Telegram allows interacting with music search bots (`@MusicsHuntersbot` and `@applemusicdw_bot`) directly within the channel, downloading tracks into your vault without running separate local download scripts.
+
+> [!WARNING]
+> **Keep your channel Private:** Always set your storage channel type to **Private** (accessed via numeric channel ID or invite link, not a public `@username`). Public channels are indexed by global search engines and monitored by automated record label crawlers (IFPI, Sony, T-Series), which can trigger copyright takedown bans. Private channels are not indexed and function safely as personal cloud storage.
+
+## Channel commands and music search
+
+### `/song` Downloader
+The addon monitors your music channel for `/song` commands and downloads tracks directly into your vault:
+
+- **Interactive Search with Pagination (10 Results):** Type `/song <song name>` (e.g. `/song brown rang`). TeleMusic queries `@MusicsHuntersbot` (Deezer/Qobuz FLAC) with relevance verification and Apple Music fallback (`@applemusicdw_bot`).
+  - **With Bot Token (`TELEGRAM_BOT_TOKEN`):** Displays real Telegram inline UI buttons `[ 1️⃣ ] [ 2️⃣ ] [ 3️⃣ ] [ 4️⃣ ] [ 5️⃣ ]`, `[ ➡️ Next (6-10) ]`, `[ 🔄 Switch Catalog ]`, and `[ ❌ Cancel ]` directly under the message. Tapping Next flips in-place to options 6–10.
+  - **Without Bot Token (Default):** Displays direct command links (`/1` through `/10`), plus `/next`, `/prev`, `/switch`, and `/cancel`.
+- **One-Tap Catalog Switch:** If Deezer results don't have what you want, tap `[ 🔄 Try Apple Music ALAC ]` (or send `/switch`) to search Apple Music's 100M+ lossless library. No links needed—TeleMusic queries Apple's catalog API automatically.
+- **Direct Option Selection:** Skip the menu by specifying the number directly: `/song Kesariya 2`.
+- **Direct Link Downloads:** Paste streaming links directly: `/song https://open.spotify.com/track/...` or Apple Music / Deezer / Tidal URLs. TeleMusic downloads the exact track in Studio Lossless.
+
+### `/keep` Caption Flag
+If you intentionally want to keep multiple versions of a song (for example, a 16-bit FLAC alongside a 320kbps MP3 or a specific radio edit), include `/keep`, `#keep`, or `/ig` in the caption when uploading. The deduplication engine recognizes this tag and preserves both files permanently.
+
+### Automatic Channel Cleaner
+The channel listener automatically purges non-music clutter (casual text chat, photos, stickers, GIFs, regular videos, and spam links) to keep the music library clean. Audio files and commands beginning with `/` are preserved.
 
 ## How it works
 
-1. You upload audio files (FLAC, ALAC, WAV, MP3, M4A) to a Telegram channel.
+1. You upload audio files (FLAC, ALAC, WAV, MP3, M4A) to a private Telegram channel.
 2. The server authenticates with Telegram via MTProto (GramJS) using a user session, bypassing standard bot file size limits.
 3. The server extracts audio metadata (title, artist, album, bit depth, sample rate) and builds a local index.
 4. BitChord queries `/manifest.json`, `/search?q=...`, and `/stream/:id` using its pluggable source protocol.
@@ -42,7 +74,7 @@ BitChord searches this server whenever a track is requested. If the track is pre
 
 - Node.js 18+
 - Telegram account with `API_ID` and `API_HASH` from [my.telegram.org](https://my.telegram.org)
-- A dedicated Telegram channel (public or private) for storing audio files
+- A dedicated **private** Telegram channel for storing audio files
 
 ### 2. Setup and authentication
 
@@ -91,6 +123,7 @@ Set the following environment variables in your deployment dashboard:
 | `TELEGRAM_CHANNEL` | Channel username (e.g. `@my_vault`) or numeric ID (e.g. `-1001234567890`) |
 | `PORT` | Web server port (defaults to `3000` or assigned by host) |
 | `ENABLE_CHANNEL_NOTIFICATIONS` | *(Optional)* Set to `true` if you want cleanup summary notifications posted to your channel (default: `false` / 100% silent) |
+| `TELEGRAM_BOT_TOKEN` | *(Optional)* Bot token from @BotFather to enable real square UI buttons `[ 1️⃣ ] [ 2️⃣ ] [ 3️⃣ ] [ 4️⃣ ] [ 5️⃣ ]` under `/song` results. If not set, the addon renders direct clickable `/1`–`/5` command links with zero setup required. |
 
 ### 5. Keeping It Running 24/7 (Preventing Cold Starts)
 
