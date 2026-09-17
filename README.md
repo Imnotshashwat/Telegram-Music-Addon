@@ -62,6 +62,9 @@ npm run login
 
 The interactive prompt will request your API ID, API hash, phone number, login code, and channel handle or numeric ID.
 
+> [!TIP]
+> For architecture diagrams, tips on keeping your session private, finding numeric channel IDs, or running via Fly.io / Cloudflare Tunnels, see [TELEGRAM_SETUP.md](TELEGRAM_SETUP.md).
+
 ### 3. Start the server
 
 ```bash
