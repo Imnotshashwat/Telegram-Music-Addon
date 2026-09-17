@@ -60,9 +60,9 @@ The script writes your credentials to `.env`.
 2. Get the numeric channel ID:
    * Forward any message from your private channel to `@userinfobot` or `@getidsbot` to retrieve the numeric ID (starts with `-100...`, e.g. `-1001234567890`).
 3. Upload audio files:
-   * Always upload audio as **Files / Documents** rather than compressed audio. Telegram compresses standard music uploads, which strips FLAC quality and tags.
-   * You can add `/keep` or `#keep` in the upload caption to exempt a track from duplicate removal.
-   * The server automatically indexes new files as soon as they appear in the channel.
+   * Always upload audio as files or documents rather than compressed audio. Telegram compresses standard music uploads, which removes FLAC tags and degrades quality.
+   * To keep multiple versions of the same song, add `/keep` or `#keep` in the caption, or reply to the uploaded file with `/keep` within the 15-second grace window.
+   * The server indexes new files as soon as they reach the channel.
 
 ## 3.1 (Optional) Add a bot for inline buttons
 

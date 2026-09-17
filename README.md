@@ -20,10 +20,11 @@ BitChord searches this server whenever a track is requested. If the track is pre
 
 ## Channel commands and music search
 
-### Song Search and Downloads (`/s`)
-The addon listens for `/s` commands in your channel and downloads tracks in lossless FLAC:
+### Song search and downloads
 
-- **Interactive 7-Track Search:** Send `/s <song name>` (for example, `/s brown rang`). The addon searches Deezer through `@MusicsHuntersbot`:
+The addon listens for `/s`, `/song`, `#s`, and `#song` commands in your channel and downloads tracks in lossless FLAC:
+
+- Interactive 7-track search: Send `/s <song name>` or `#s <song name>` (for example, `/s brown rang`). The addon queries Deezer through `@MusicsHuntersbot`:
   ```text
   🎧 Search Results for: "brown rang" [Deezer FLAC]
 
@@ -35,30 +36,21 @@ The addon listens for `/s` commands in your channel and downloads tracks in loss
   6. ...
   7. ...
   ```
-  - **Inline Buttons (`TELEGRAM_BOT_TOKEN`):** If a bot token is configured, the addon adds square buttons `[ 1 ]` to `[ 7 ]` and navigation buttons `[ ⬅️ ] [ ❌ ] [ ➡️ ]` under the message.
-  - **Live Paging:** Tapping `➡️` or `⬅️` sends a click to `@MusicsHuntersbot` in the background, loads the next 7 tracks (like tracks 8 to 14 on page 2), and updates the message in place.
-  - **Direct Download:** Tapping any number button (or typing `/1` to `/14`) downloads that track in lossless FLAC directly to your channel.
-- **Direct Link Downloads:** Paste streaming links directly: `/s https://open.spotify.com/track/...` or Deezer, Tidal, or Qobuz URLs. The addon downloads the track in original FLAC.
+  - Inline buttons: If you configure a bot token, the addon adds buttons `[ 1 ]` to `[ 7 ]` and navigation buttons `[ ⬅️ ] [ ❌ ] [ ➡️ ]` under the message. See [TELEGRAM_SETUP.md](TELEGRAM_SETUP.md#31-optional-add-a-bot-for-inline-buttons) to set this up.
+  - Page navigation: Tapping `➡️` or `⬅️` loads the next or previous set of tracks and updates the message in place.
+  - Track download: Tapping a number button (or typing `/1` to `/14`) downloads that track directly into your channel.
+- Direct link downloads: Paste streaming links directly, such as `/s https://open.spotify.com/track/...` or Deezer, Tidal, and Qobuz URLs.
 
-### Setting Up Inline Buttons with a Personal Bot
-Telegram user accounts cannot post messages with inline keyboard buttons into channels. Connecting a personal bot lets the addon attach clickable buttons under search results:
+### Keeping duplicate songs
 
-1. Open Telegram and message [@BotFather](https://t.me/BotFather).
-2. Send `/newbot`, name your bot (for example, `MyMusicBot`), and give it a unique username ending in `bot` (for example, `my_music_vault_bot`).
-3. Copy the HTTP API token BotFather gives you.
-4. Add the token to your `.env` file (and in your cloud environment variables):
-   ```env
-   TELEGRAM_BOT_TOKEN="1234567890:ABCdefGHIjklMNOpqrsTUVwxyz"
-   ```
-5. Open your private music channel settings, go to **Administrators** > **Add Administrator**, search for your bot username, and turn on **Post Messages** and **Edit Messages** permissions.
-6. Start the server (`npm start`). The addon will now post search menus with inline buttons and process callback clicks.
+If you want to keep multiple versions of a track (such as a 16-bit FLAC alongside a 24-bit copy or a radio edit), you have two options:
+- In the file caption: Add `/keep`, `#keep`, or `/ig` to the caption when uploading.
+- During the 15-second grace window: When an upload or `/s` download matches a track already in your library, the server holds the file for 15 seconds before deleting it. Reply to the file message with `/keep` or `#keep` (or send `/keep` in the channel) to keep both copies.
 
-### `/keep` Caption Flag
-If you want to keep multiple versions of a song (such as a 16-bit FLAC alongside a 320kbps MP3 or a radio edit), include `/keep`, `#keep`, or `/ig` in the caption when uploading. The deduplication check will skip the file and keep both copies.
+### User chatter auto-cleaner
 
-### User Chatter Auto-Cleaner
-The channel listener removes casual chat messages, photos, stickers, GIFs, regular videos, and spam links sent by regular users.
-- **Bot and System Immunity:** Messages from bots, menus with buttons, channel admin posts, system status updates, slash commands (`/`), and audio files are never deleted.
+The channel listener deletes casual chat, photos, stickers, GIFs, and spam sent by regular members to keep the music feed clean.
+- Bot and system immunity: Messages from bots, menus with buttons, channel admin posts, system status updates, slash commands, and audio files are never deleted.
 
 ## How it works
 

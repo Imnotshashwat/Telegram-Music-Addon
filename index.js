@@ -305,10 +305,10 @@ async function parseTrackMessage(msg) {
   let bitDepth = undefined;
   let isrc = undefined;
 
-  // Try to inspect the first 128KB for lossless FLAC/ALAC/WAV tags or missing title/performer
-  const shouldSniffTags = resolvedExt === 'flac' || resolvedExt === 'alac' || resolvedExt === 'wav' || resolvedExt === 'm4a' || !audioAttr || !audioAttr.title;
+  // Inspect the first 128KB only if title or performer are missing from Telegram audio attributes
+  const shouldSniffTags = (!audioAttr || !audioAttr.title || !audioAttr.performer) && sizeBytes > 0;
   let parsedCodec = null;
-  if (shouldSniffTags && sizeBytes > 0) {
+  if (shouldSniffTags) {
     try {
       const headerBuf = await getHeaderChunk(msg.media, Math.min(128 * 1024, sizeBytes));
       if (headerBuf && headerBuf.length > 0) {
@@ -605,10 +605,21 @@ async function flushDigestNotifications() {
 
   let text = `🧹 <b>Library Cleanup Digest (30m Summary)</b>\n\n`;
   for (const item of displayed) {
-    const action = item.action === 'upgrade' ? 'Quality Upgrade' : (item.action === 'cleanup' ? 'Library Cleanup' : 'Duplicate Removed');
+    let actionLabel = 'Duplicate Removed';
+    if (item.action === 'upgrade') {
+      actionLabel = 'Quality Upgrade (Better FLAC kept)';
+    } else if (item.reason === 'lower_quality') {
+      actionLabel = 'Lower Quality (Better version already in library)';
+    } else if (item.reason === 'identical' || item.reason === 'identical_duplicate') {
+      actionLabel = 'Identical Duplicate (Exact match already present)';
+    } else if (item.action === 'cleanup') {
+      actionLabel = item.reason === 'lower_quality' ? 'Lower Quality Removed' : 'Identical Duplicate Cleaned';
+    }
+
     text += `• <b>${item.title}</b> — <i>${item.artist}</i>\n`;
     text += `  ✅ Kept: ${item.keptQuality} [${item.keptSize}]\n`;
-    text += `  ❌ Deleted: ${item.deletedQuality} [${item.deletedSize}] (${action})\n\n`;
+    text += `  ❌ Deleted: ${item.deletedQuality} [${item.deletedSize}]\n`;
+    text += `  <i>Reason: ${actionLabel}</i>\n\n`;
   }
 
   if (remainingCount > 0) {
@@ -661,18 +672,55 @@ async function sendChannelNotification(text) {
   }
 }
 
-async function deleteTelegramMessage(messageId) {
-  try {
-    const id = parseInt(messageId, 10);
-    if (channelEntity && id) {
-      await client.deleteMessages(channelEntity, [id], { revoke: true });
-      console.log(`[Deleted Telegram Message] ID: ${id}`);
-      return true;
+// Pending duplicate deletions: maps messageId (string) -> { timer, track, existingDup, reason }
+// Gives user a 15-second grace window to reply with /keep if they want to preserve the duplicate
+const pendingDeletions = new Map();
+const DUPLICATE_GRACE_PERIOD_MS = 15000; // 15 seconds
+
+function cancelPendingDeletion(messageId) {
+  const key = String(messageId);
+  if (pendingDeletions.has(key)) {
+    const pending = pendingDeletions.get(key);
+    clearTimeout(pending.timer);
+    pendingDeletions.delete(key);
+    if (pending.noticeMsgId && channelEntity) {
+      deleteTelegramMessages([pending.noticeMsgId]).catch(() => {});
     }
+    console.log(`[Keep Flag] Cancelled pending deletion for message ID: ${key}`);
+    return pending;
+  }
+  return null;
+}
+
+async function deleteTelegramMessages(messageIds) {
+  try {
+    if (!channelEntity || !Array.isArray(messageIds) || messageIds.length === 0) return false;
+    const ids = messageIds
+      .map((id) => (typeof id === 'number' ? id : parseInt(id, 10)))
+      .filter((id) => typeof id === 'number' && !isNaN(id) && id > 0);
+
+    if (ids.length === 0) return false;
+
+    await client.deleteMessages(channelEntity, ids, { revoke: true });
+    console.log(`[Deleted Telegram Messages] IDs: ${ids.join(', ')}`);
+    return true;
   } catch (err) {
-    console.warn(`[Delete Message Error] ID ${messageId}:`, err.message);
+    console.warn(`[Delete Messages Error] IDs ${JSON.stringify(messageIds)}:`, err.message);
+    // Fallback: try deleting individually if batch failed
+    for (const rawId of messageIds) {
+      const singleId = typeof rawId === 'number' ? rawId : parseInt(rawId, 10);
+      if (singleId && !isNaN(singleId) && singleId > 0) {
+        await client.deleteMessages(channelEntity, [singleId], { revoke: true }).catch((e) => {
+          console.warn(`[Delete Message Fallback Error] ID ${singleId}:`, e.message);
+        });
+      }
+    }
   }
   return false;
+}
+
+async function deleteTelegramMessage(messageId) {
+  return deleteTelegramMessages([messageId]);
 }
 
 async function processTrackUpload(newTrack) {
@@ -722,23 +770,56 @@ async function processTrackUpload(newTrack) {
 
     return newTrack;
   } else {
-    // Incoming track is LOWER or EQUAL quality: delete incoming upload!
-    console.log(`Discarding incoming duplicate of "${newTrack.title}". Keeping existing ${describeTrackQuality(existingDup)}.`);
-
-    await deleteTelegramMessage(newTrack.id);
-
+    // Incoming track is LOWER or EQUAL quality: schedule deletion with 15s grace window!
     const isLower = scoreNew < scoreOld;
-    queueDuplicateNotification({
-      action: 'discard',
-      title: newTrack.title,
-      artist: newTrack.artist,
-      keptQuality: describeTrackQuality(existingDup),
-      keptSize: formatBytes(existingDup.sizeBytes),
-      deletedQuality: describeTrackQuality(newTrack),
-      deletedSize: formatBytes(newTrack.sizeBytes),
+    const reason = isLower ? 'lower_quality' : 'identical';
+    console.log(`Scheduling duplicate deletion for "${newTrack.title}" (ID: ${newTrack.id}) in ${DUPLICATE_GRACE_PERIOD_MS / 1000}s. Reply with /keep to preserve it.`);
+
+    let noticeMsg = null;
+    if (channelEntity) {
+      const noticeText = isLower
+        ? `**Duplicate detected:** Lower quality (${describeTrackQuality(newTrack)}) than existing copy (${describeTrackQuality(existingDup)}). Deleting in 15s... (Send \`/keep\` to save)`
+        : `**Duplicate detected:** Identical copy already in library. Deleting in 15s... (Send \`/keep\` to save)`;
+
+      noticeMsg = await client.sendMessage(channelEntity, {
+        message: noticeText,
+        replyTo: parseInt(newTrack.id, 10),
+      }).catch(() => null);
+    }
+
+    const timer = setTimeout(async () => {
+      pendingDeletions.delete(String(newTrack.id));
+      console.log(`[Grace Period Expired] Deleting duplicate track: "${newTrack.title}" (ID: ${newTrack.id})`);
+      const msgsToDelete = [newTrack.id];
+      if (noticeMsg && noticeMsg.id) msgsToDelete.push(noticeMsg.id);
+      await deleteTelegramMessages(msgsToDelete);
+
+      queueDuplicateNotification({
+        action: 'discard',
+        reason,
+        title: newTrack.title,
+        artist: newTrack.artist,
+        keptQuality: describeTrackQuality(existingDup),
+        keptSize: formatBytes(existingDup.sizeBytes),
+        deletedQuality: describeTrackQuality(newTrack),
+        deletedSize: formatBytes(newTrack.sizeBytes),
+      });
+    }, DUPLICATE_GRACE_PERIOD_MS);
+
+    pendingDeletions.set(String(newTrack.id), {
+      timer,
+      track: newTrack,
+      existingDup,
+      reason,
+      noticeMsgId: noticeMsg?.id || null,
     });
 
-    return null;
+    return {
+      discarded: true,
+      reason,
+      keptQuality: describeTrackQuality(existingDup),
+      deletedQuality: describeTrackQuality(newTrack),
+    };
   }
 }
 
@@ -763,8 +844,10 @@ async function deduplicateEntireLibrary() {
       await deleteTelegramMessage(track.id);
       removed.push({ deleted: track, kept: dup });
 
+      const isLower = getQualityScore(track) < getQualityScore(dup);
       queueDuplicateNotification({
         action: 'cleanup',
+        reason: isLower ? 'lower_quality' : 'identical',
         title: dup.title,
         artist: dup.artist,
         keptQuality: describeTrackQuality(dup),
@@ -784,44 +867,62 @@ async function deduplicateEntireLibrary() {
     console.log('Deduplication check: Library is 100% clean, no duplicates found.');
   }
 
+  await cleanupOrphanedDuplicateNotices().catch(() => {});
+
   return { checked: sorted.length, duplicatesRemoved: removed.length, removed };
 }
 
 async function buildTrackIndex() {
-  console.log('Indexing Telegram channel...');
+  console.log('Indexing Telegram channel (adaptive full history scan)...');
   try {
-    const messages = await client.getMessages(channelEntity, { limit: 500 });
     const newIndex = [];
+    const seenIds = new Set();
+    let batchCount = 0;
 
-    for (const msg of messages) {
-      // Always cache media object for instant seeking
-      if (msg.media) {
-        mediaCache.set(String(msg.id), msg.media);
-      }
+    // GramJS iterMessages streams through channel history from newest to oldest.
+    // Specifying limit: 5000 with waitTime: 0 guarantees full fast iteration without GramJS timeout warnings.
+    for await (const msg of client.iterMessages(channelEntity, { limit: 5000, waitTime: 0 })) {
+      const msgIdStr = String(msg.id);
+      if (seenIds.has(msgIdStr)) continue;
+      seenIds.add(msgIdStr);
 
-      // Check if we already have this message ID cached with full details
-      const existing = trackIndex.find((t) => t.id === String(msg.id));
-      if (existing) {
-        if (!existing.sizeBytes && msg.media?.document?.size) {
-          existing.sizeBytes = Number(msg.media.document.size);
-        }
-        newIndex.push(existing);
+      // Fast check: If message has no document or is not an audio file, skip immediately
+      const doc = msg.media?.document;
+      if (!doc || !isAudioDocument(doc)) {
         continue;
       }
 
-      const parsed = await parseTrackMessage(msg);
-      if (parsed) {
-        newIndex.push(parsed);
+      // Always cache media object for instant seeking
+      mediaCache.set(msgIdStr, msg.media);
+
+      // Check if we already have this message ID cached with full metadata
+      const existing = trackIndex.find((t) => t.id === msgIdStr);
+      if (existing) {
+        if (!existing.sizeBytes && doc.size) {
+          existing.sizeBytes = Number(doc.size);
+        }
+        newIndex.push(existing);
+      } else {
+        const parsed = await parseTrackMessage(msg);
+        if (parsed) {
+          newIndex.push(parsed);
+        }
+      }
+
+      batchCount++;
+      if (batchCount % 50 === 0) {
+        trackIndex = [...newIndex];
+        console.log(`[Indexer] Indexed ${newIndex.length} audio tracks... (latest msg ID: ${msgIdStr})`);
       }
     }
 
     trackIndex = newIndex;
     lastIndexed = Date.now();
     saveCache();
-    console.log(`Indexing complete! ${trackIndex.length} track(s) ready in library.`);
+    console.log(`Adaptive indexing complete! Scanned ${batchCount} total messages. ${trackIndex.length} track(s) ready in library.`);
     await deduplicateEntireLibrary();
   } catch (err) {
-    console.error('Error during track indexing:', err.message);
+    console.error('Error during adaptive track indexing:', err.message);
   }
 }
 
@@ -1015,8 +1116,8 @@ async function onTrackForwarded(msg) {
     const track = await parseTrackMessage(msg);
     if (track) {
       const processed = await processTrackUpload(track);
-      if (processed === null) {
-        return { discarded: true };
+      if (processed && processed.discarded) {
+        return processed;
       }
       console.log(`[AutoIndex] Successfully indexed newly uploaded track: "${track.title}" (ID: ${track.id})`);
       return { indexed: true, track: processed };
@@ -1393,7 +1494,31 @@ async function resolveChannel() {
   return await client.getEntity(cleanInput);
 }
 
-const SYSTEM_PREFIXES = ['Searching for', '🎧', '🔍', '⏳', '🚀', '✅', '❌', 'ℹ️', '🧹', '⚠️'];
+const SYSTEM_PREFIXES = ['Searching for', '🎧', '🔍', '⏳', '🚀', '✅', '❌', 'ℹ️', '🧹', '⚠️', 'Duplicate detected', '**Duplicate detected'];
+
+async function cleanupOrphanedDuplicateNotices() {
+  if (!channelEntity) return;
+  try {
+    const recent = await client.getMessages(channelEntity, { limit: 50 });
+    const toDelete = [];
+    const now = Math.floor(Date.now() / 1000);
+    for (const msg of recent) {
+      const text = msg.message || msg.text || '';
+      if (text.includes('Duplicate detected:') && (text.includes('Deleting in 15s') || text.includes('Send /keep to save'))) {
+        const msgAgeSec = now - (msg.date || 0);
+        if (msgAgeSec > 20) {
+          toDelete.push(msg.id);
+        }
+      }
+    }
+    if (toDelete.length > 0) {
+      console.log(`[Cleanup] Found ${toDelete.length} orphaned duplicate warning notice(s). Deleting...`);
+      await deleteTelegramMessages(toDelete);
+    }
+  } catch (err) {
+    console.warn('[Cleanup Error]:', err.message);
+  }
+}
 
 async function isFromBot(msg) {
   if (!msg) return false;
@@ -1467,6 +1592,7 @@ async function startBotCallbackPoller(botToken) {
 
     channelEntity = await resolveChannel();
     console.log(`Using Telegram channel: ${channelEntity.title || channelEntity.username || CHANNEL}`);
+    await cleanupOrphanedDuplicateNotices();
 
     const BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
     if (BOT_TOKEN) {
@@ -1483,8 +1609,8 @@ async function startBotCallbackPoller(botToken) {
         const isSelfChat = message.isPrivate; // e.g. Saved Messages
         const trimmedText = (message.text || message.message || '').trim();
 
-        // 1. Check for /s command
-        if (/^\/s(?:\s+.*)?$/i.test(trimmedText)) {
+        // 1. Check for /s, /song, #s, #song commands
+        if (/^[#/](?:song|s)(?:\s+.*)?$/i.test(trimmedText)) {
           if (isMusicChannel || isSelfChat) {
             console.log(`[Song Command] Detected: "${trimmedText}" (msg ID: ${message.id})`);
             handleSongCommand(client, channelEntity, trimmedText, message.id, onTrackForwarded).catch((err) => {
@@ -1533,7 +1659,60 @@ async function startBotCallbackPoller(botToken) {
           }
         }
 
-        // 4. Check for incoming audio file upload
+        // 5. Check for /keep, #keep, /ig, #ig command (can be a reply to an audio message or standalone)
+        if (/^[#/](?:keep|ig)(?:\s+.*)?$/i.test(trimmedText)) {
+          if (isMusicChannel) {
+            let targetKey = null;
+            const repliedId = message.replyTo?.replyToMsgId || message.replyToMsgId ? String(message.replyTo?.replyToMsgId || message.replyToMsgId) : null;
+
+            if (repliedId) {
+              // Check if user replied directly to the audio track
+              if (pendingDeletions.has(repliedId)) {
+                targetKey = repliedId;
+              } else {
+                // Check if user replied to the notice warning message
+                for (const [trackId, info] of pendingDeletions.entries()) {
+                  if (info.noticeMsgId && String(info.noticeMsgId) === repliedId) {
+                    targetKey = trackId;
+                    break;
+                  }
+                }
+              }
+            }
+
+            // Standalone: if user sent /keep or #keep without replying, pick the latest pending duplicate
+            if (!targetKey && pendingDeletions.size > 0) {
+              const allKeys = Array.from(pendingDeletions.keys());
+              targetKey = allKeys[allKeys.length - 1];
+            }
+
+            if (targetKey && pendingDeletions.has(targetKey)) {
+              const cancelled = cancelPendingDeletion(targetKey);
+              if (cancelled && cancelled.track) {
+                cancelled.track.keep = true;
+                trackIndex.unshift(cancelled.track);
+                saveCache();
+                console.log(`[Keep Flag] Preserved duplicate track "${cancelled.track.title}" (msg ID: ${targetKey}) via keep command.`);
+                const confirmMsg = await client.sendMessage(channelEntity, {
+                  message: `✅ **Preserved:** "${cancelled.track.title}" will be kept in your library.`
+                }).catch(() => null);
+                if (confirmMsg) {
+                  setTimeout(() => {
+                    client.deleteMessages(channelEntity, [confirmMsg.id, message.id], { revoke: true }).catch(() => {});
+                  }, 12000);
+                }
+              }
+            } else {
+              // Delete unrecognized keep command after 4 seconds
+              setTimeout(() => {
+                client.deleteMessages(channelEntity, [message.id], { revoke: true }).catch(() => {});
+              }, 4000);
+            }
+            return;
+          }
+        }
+
+        // 6. Check for incoming audio file upload
         const doc = message.media?.document;
         if (doc && isAudioDocument(doc)) {
           if (!isMusicChannel) return;

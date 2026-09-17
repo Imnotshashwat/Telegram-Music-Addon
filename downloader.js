@@ -284,6 +284,26 @@ function isPickerMenu(channelEntity, messageId) {
   return Boolean(session && session.menuMsgId === messageId);
 }
 
+async function deleteMessagesSafely(client, channelEntity, messageIds) {
+  try {
+    if (!channelEntity || !Array.isArray(messageIds) || messageIds.length === 0) return false;
+    const ids = messageIds
+      .map((id) => (typeof id === 'number' ? id : parseInt(id, 10)))
+      .filter((id) => typeof id === 'number' && !isNaN(id) && id > 0);
+    if (ids.length === 0) return false;
+    await client.deleteMessages(channelEntity, ids, { revoke: true });
+    return true;
+  } catch (_) {
+    for (const rawId of messageIds) {
+      const singleId = typeof rawId === 'number' ? rawId : parseInt(rawId, 10);
+      if (singleId && !isNaN(singleId) && singleId > 0) {
+        await client.deleteMessages(channelEntity, [singleId], { revoke: true }).catch(() => {});
+      }
+    }
+  }
+  return false;
+}
+
 async function cancelPicker(client, channelEntity) {
   if (!channelEntity) return false;
   const channelId = utils.getPeerId(channelEntity).toString();
@@ -295,7 +315,7 @@ async function cancelPicker(client, channelEntity) {
 
   const msgsToDelete = [session.menuMsgId];
   if (session.originalMsgId) msgsToDelete.push(session.originalMsgId);
-  client.deleteMessages(channelEntity, msgsToDelete.filter(Boolean), { revoke: true }).catch(() => {});
+  deleteMessagesSafely(client, channelEntity, msgsToDelete).catch(() => {});
   return true;
 }
 
@@ -397,29 +417,29 @@ async function handlePickerChoice(client, channelEntity, optionNum, onTrackForwa
     }
 
     if (forwardResult && forwardResult.discarded) {
-      await updateStatus(`ℹ️ **${candTitle} is already in your library!** (Duplicate removed)`);
+      if (forwardResult.reason === 'lower_quality') {
+        await updateStatus(`**Duplicate detected:** Lower quality (${forwardResult.deletedQuality}) than existing copy (${forwardResult.keptQuality}). Deleting in 15s... (Send \`/keep\` to save)`);
+      } else {
+        await updateStatus(`**Duplicate detected:** Identical copy already in library. Deleting in 15s... (Send \`/keep\` to save)`);
+      }
     } else {
       await updateStatus(`✅ **Added ${candTitle} to Music Library!**`);
     }
 
-    setTimeout(async () => {
-      try {
-        const msgsToDelete = [session.menuMsgId];
-        if (session.originalMsgId) msgsToDelete.push(session.originalMsgId);
-        await client.deleteMessages(channelEntity, msgsToDelete.filter(Boolean), { revoke: true });
-      } catch (_) {}
-    }, 6000);
+    setTimeout(() => {
+      const msgsToDelete = [session.menuMsgId];
+      if (session.originalMsgId) msgsToDelete.push(session.originalMsgId);
+      deleteMessagesSafely(client, channelEntity, msgsToDelete).catch(() => {});
+    }, 18000);
 
     return true;
   } catch (err) {
     console.error('[Downloader] Picker choice failed:', err.message);
     await updateStatus(`❌ **Download Failed:** ${err.message}`);
-    setTimeout(async () => {
-      try {
-        const msgsToDelete = [session.menuMsgId];
-        if (session.originalMsgId) msgsToDelete.push(session.originalMsgId);
-        await client.deleteMessages(channelEntity, msgsToDelete.filter(Boolean), { revoke: true });
-      } catch (_) {}
+    setTimeout(() => {
+      const msgsToDelete = [session.menuMsgId];
+      if (session.originalMsgId) msgsToDelete.push(session.originalMsgId);
+      deleteMessagesSafely(client, channelEntity, msgsToDelete).catch(() => {});
     }, 10000);
     return false;
   }
@@ -427,19 +447,19 @@ async function handlePickerChoice(client, channelEntity, optionNum, onTrackForwa
 
 
 /**
- * Handles `/s` channel command.
+ * Handles `/s`, `/song`, `#s`, `#song` channel commands.
  * Supports direct URLs, explicit option numbers (`/s <query> <num>`),
  * and interactive 7-option selection menus (`/s <query>`).
  */
 async function handleSongCommand(client, channelEntity, commandText, originalMsgId = null, onTrackForwarded = null) {
   const text = commandText.trim();
-  const match = text.match(/^\/s(?:\s+(.+))?$/i);
+  const match = text.match(/^[#/](?:song|s)(?:\s+(.+))?$/i);
   if (!match || !match[1]) {
     const helpMsg = await client.sendMessage(channelEntity, {
-      message: 'ℹ️ **Usage:**\n• `/s <song name>` — browse 7 choices\n• `/s <Spotify / Deezer / Tidal URL>` — direct download'
+      message: '**Usage:**\n• `/s <song name>` or `#s <song name>` — browse 7 choices\n• `/s <Spotify / Deezer / Tidal URL>` — direct download'
     });
     setTimeout(() => {
-      client.deleteMessages(channelEntity, [helpMsg.id, originalMsgId].filter(Boolean), { revoke: true }).catch(() => {});
+      deleteMessagesSafely(client, channelEntity, [helpMsg.id, originalMsgId]).catch(() => {});
     }, 10000);
     return;
   }
@@ -451,7 +471,7 @@ async function handleSongCommand(client, channelEntity, commandText, originalMsg
   if (activePickers.has(channelId)) {
     const prev = activePickers.get(channelId);
     clearTimeout(prev.timer);
-    client.deleteMessages(channelEntity, [prev.menuMsgId], { revoke: true }).catch(() => {});
+    deleteMessagesSafely(client, channelEntity, [prev.menuMsgId]).catch(() => {});
     activePickers.delete(channelId);
   }
 
@@ -592,28 +612,28 @@ async function handleSongCommand(client, channelEntity, commandText, originalMsg
     }
 
     if (forwardResult && forwardResult.discarded) {
-      await updateStatus(`ℹ️ **Already in your library!** (Duplicate removed)`);
+      if (forwardResult.reason === 'lower_quality') {
+        await updateStatus(`**Duplicate detected:** Lower quality (${forwardResult.deletedQuality}) than existing copy (${forwardResult.keptQuality}). Deleting in 15s... (Send \`/keep\` to save)`);
+      } else {
+        await updateStatus(`**Duplicate detected:** Identical copy already in library. Deleting in 15s... (Send \`/keep\` to save)`);
+      }
     } else {
       await updateStatus(`✅ **Added to Music Library!**`);
     }
 
-    setTimeout(async () => {
-      try {
-        const msgsToDelete = [statusMsg.id];
-        if (originalMsgId) msgsToDelete.push(originalMsgId);
-        await client.deleteMessages(channelEntity, msgsToDelete, { revoke: true });
-      } catch (_) {}
-    }, 8000);
+    setTimeout(() => {
+      const msgsToDelete = [statusMsg.id];
+      if (originalMsgId) msgsToDelete.push(originalMsgId);
+      deleteMessagesSafely(client, channelEntity, msgsToDelete).catch(() => {});
+    }, 18000);
 
   } catch (err) {
     console.error('[Downloader] Song command failed:', err.message);
     await updateStatus(`❌ **Download Failed:** ${err.message}`);
-    setTimeout(async () => {
-      try {
-        const msgsToDelete = [statusMsg.id];
-        if (originalMsgId) msgsToDelete.push(originalMsgId);
-        await client.deleteMessages(channelEntity, msgsToDelete, { revoke: true });
-      } catch (_) {}
+    setTimeout(() => {
+      const msgsToDelete = [statusMsg.id];
+      if (originalMsgId) msgsToDelete.push(originalMsgId);
+      deleteMessagesSafely(client, channelEntity, msgsToDelete).catch(() => {});
     }, 12000);
   }
 }
