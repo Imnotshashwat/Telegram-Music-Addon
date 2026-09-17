@@ -7,106 +7,6 @@ const REMIX_KEYWORDS = [
 ];
 
 /**
- * Searches Apple Music via the official, free iTunes Search API.
- * Uses country=IN by default for Indian releases, with fallback to US.
- */
-async function searchAppleMusic(query, country = 'IN', limit = 20) {
-  try {
-    const cleanQuery = query.trim();
-    let url = `https://itunes.apple.com/search?term=${encodeURIComponent(cleanQuery)}&country=${country}&entity=song&limit=${limit}`;
-    let res = await fetch(url);
-    let data = await res.json();
-
-    if ((!data.results || data.results.length === 0) && country !== 'US') {
-      url = `https://itunes.apple.com/search?term=${encodeURIComponent(cleanQuery)}&country=US&entity=song&limit=${limit}`;
-      res = await fetch(url);
-      data = await res.json();
-    }
-
-    return (data.results || []).map((r, idx) => {
-      const durationSec = Math.round((r.trackTimeMillis || 0) / 1000);
-      const mins = Math.floor(durationSec / 60);
-      const secs = (durationSec % 60).toString().padStart(2, '0');
-      return {
-        optionNum: idx + 1,
-        id: r.trackId,
-        title: r.trackName,
-        artist: r.artistName,
-        album: r.collectionName,
-        durationSec,
-        durationStr: `${mins}:${secs}`,
-        url: r.trackViewUrl,
-        artwork: r.artworkUrl100 ? r.artworkUrl100.replace('100x100bb', '600x600bb') : null,
-      };
-    });
-  } catch (err) {
-    console.error('[AppleSearch] Error querying iTunes API:', err.message);
-    return [];
-  }
-}
-
-/**
- * Scores an Apple Music candidate to prioritize the authentic original movie/album version.
- */
-function scoreAppleMusicCandidate(candidate, originalQuery) {
-  let score = 100;
-  const qLower = originalQuery.toLowerCase();
-  const titleLower = (candidate.title || '').toLowerCase();
-  const albumLower = (candidate.album || '').toLowerCase();
-
-  // If the user did not specifically ask for remix/dj, penalize remix markers
-  const userWantsRemix = REMIX_KEYWORDS.some(k => qLower.includes(k));
-  if (!userWantsRemix) {
-    for (const kw of REMIX_KEYWORDS) {
-      if (titleLower.includes(kw) || albumLower.includes(kw)) {
-        score -= 80;
-        break;
-      }
-    }
-  }
-
-  // Boost original soundtrack or movie markers
-  if (titleLower.includes('from "') || titleLower.includes('soundtrack') || albumLower.includes('original')) {
-    score += 40;
-  }
-
-  // Bollywood/pop original songs are usually full length (>= 3:30)
-  if (candidate.durationSec >= 210) {
-    score += 20;
-  } else if (candidate.durationSec < 150) {
-    // Short edits / tik tok cuts
-    score -= 30;
-  }
-
-  return score;
-}
-
-/**
- * Downloads ALAC Lossless (.m4a) from Apple Music via @applemusicdw_bot.
- */
-async function downloadFromAppleMusic(client, appleMusicUrl, onProgress) {
-  const botEntity = await client.getEntity('applemusicdw_bot');
-  if (onProgress) onProgress('Sending Apple Music link to @applemusicdw_bot...');
-
-  const sendMsg = await client.sendMessage(botEntity, { message: appleMusicUrl });
-  const startId = sendMsg.id;
-
-  const startTime = Date.now();
-  const timeoutMs = 45000;
-
-  while (Date.now() - startTime < timeoutMs) {
-    await new Promise(r => setTimeout(r, 2000));
-    const recentMsgs = await client.getMessages(botEntity, { limit: 5 });
-    for (const m of recentMsgs) {
-      if (m.id > startId && m.media?.document) {
-        return m;
-      }
-    }
-  }
-  throw new Error('@applemusicdw_bot timed out waiting for audio file');
-}
-
-/**
  * Parses search result lines from bot text (e.g. "1. Artist - Title (03:45)" or "**1.** Artist - Title [3:45]")
  */
 function parseBotSearchResults(text) {
@@ -152,7 +52,7 @@ function parseBotSearchResults(text) {
     }
   }
 
-  return results.slice(0, 10);
+  return results;
 }
 
 /**
@@ -170,86 +70,72 @@ function areCandidatesRelevant(candidates, query) {
   return (matchedTokens.length / qTokens.length) >= 0.6;
 }
 
-/**
- * Formats the selection menu for Telegram channel display with native clickable /number links and pagination.
- */
-function formatPickerMenu(query, candidates, engine = 'musicshunters', page = 1) {
-  const pageSize = 5;
-  const totalPages = Math.ceil(candidates.length / pageSize) || 1;
-  const currentPage = Math.min(Math.max(page, 1), totalPages);
-  const startIdx = (currentPage - 1) * pageSize;
-  const pageCandidates = candidates.slice(startIdx, startIdx + pageSize);
-
-  const list = pageCandidates.map((c, i) => {
-    const num = startIdx + i + 1;
-    const dur = c.durationStr ? ` \`(${c.durationStr})\`` : '';
-    const artist = c.artist ? `**${c.artist}** – ` : '';
-    return `/${num} ${artist}${c.title}${dur}`;
-  }).join('\n');
-
-  const engineLabel = engine === 'applemusic' ? 'Apple Music ALAC' : 'Deezer / Qobuz FLAC';
-  const pageLabel = totalPages > 1 ? ` • Page ${currentPage}/${totalPages}` : '';
-
-  let footer = `👉 **Tap any /number to download**`;
-  if (totalPages > 1) {
-    if (currentPage === 1) {
-      footer += `\n/next — Show next 5 results (6-10)`;
-    } else {
-      footer += `\n/prev — Show previous 5 results (1-5)`;
-    }
-  }
-  footer += `\n/switch — Switch search catalog\n/cancel — Dismiss search`;
-
-  return `🎧 **Search Results for:** _"${query}"_ \`[${engineLabel}${pageLabel}]\`\n\n${list}\n\n━━━━━━━━━━━━━━━━━━━━\n${footer}`;
+function escapeMarkdown(text) {
+  if (!text) return '';
+  return text.replace(/([_*`\[])/g, '\\$1');
 }
 
 /**
- * Builds the Telegram inline keyboard markup for bot interactive buttons with pagination and catalog switching.
+ * Formats the search menu text matching the reference screenshot:
+ * 🎧 **Search Results for:** _"<query>"_ `[Deezer FLAC]`
+ *
+ * 1. Artist - Title `(mm:ss)`
+ * 2. Artist - Title `(mm:ss)`
+ * ...
  */
-function buildInlineKeyboard(candidates, engine = 'musicshunters', page = 1) {
-  const pageSize = 5;
-  const totalPages = Math.ceil(candidates.length / pageSize) || 1;
-  const currentPage = Math.min(Math.max(page, 1), totalPages);
-  const startIdx = (currentPage - 1) * pageSize;
-  const pageCandidates = candidates.slice(startIdx, startIdx + pageSize);
+function formatPickerMenu(query, candidates, engine = 'deezer', page = 1) {
+  const engineLabel = 'Deezer FLAC';
+  const pageLabel = page > 1 ? ` • Page ${page}` : '';
+  const cleanQuery = escapeMarkdown(query);
+  const header = `🎧 **Search Results for:** _"${cleanQuery}"_ \`[${engineLabel}${pageLabel}]\``;
 
-  const numberEmojis = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟'];
+  const list = candidates.map((c) => {
+    const dur = c.durationStr ? ` \`(${c.durationStr})\`` : '';
+    const artist = c.artist ? `${escapeMarkdown(c.artist)} - ` : '';
+    const title = escapeMarkdown(c.title);
+    return `${c.optionNum}. ${artist}${title}${dur}`;
+  }).join('\n');
 
-  const numRow = pageCandidates.map((_, i) => {
-    const num = startIdx + i + 1;
-    return {
-      text: numberEmojis[num - 1] || `${num}`,
-      callback_data: String(num),
-    };
-  });
+  return `${header}\n\n${list}`;
+}
 
-  const keyboard = [numRow];
+/**
+ * Builds the Telegram inline keyboard markup matching @MusicsHuntersbot:
+ * Row 1: [ 1 ] [ 2 ] [ 3 ] [ 4 ] [ 5 ] [ 6 ] [ 7 ]
+ * Row 2: [ ⬅️ ] [ ❌ ] [ ➡️ ]
+ */
+function buildMusicsHuntersKeyboard(candidates, searchMsg = null) {
+  const numRow = candidates.map((c) => ({
+    text: String(c.optionNum),
+    callback_data: String(c.optionNum),
+  }));
 
   const navRow = [];
-  if (currentPage > 1) {
-    navRow.push({ text: '⬅️ Prev (1-5)', callback_data: 'page_1' });
-  }
-  if (currentPage < totalPages) {
-    navRow.push({ text: '➡️ Next (6-10)', callback_data: 'page_2' });
-  }
-  if (navRow.length > 0) {
-    keyboard.push(navRow);
+  if (searchMsg?.replyMarkup?.rows?.[1]?.buttons) {
+    for (const b of searchMsg.replyMarkup.rows[1].buttons) {
+      if (b.text === '⬅️') {
+        navRow.push({ text: '⬅️', callback_data: 'bot_prev' });
+      } else if (b.text === '❌') {
+        navRow.push({ text: '❌', callback_data: 'cancel' });
+      } else if (b.text === '➡️') {
+        navRow.push({ text: '➡️', callback_data: 'bot_next' });
+      }
+    }
   }
 
-  const switchLabel = engine === 'applemusic' ? '🔄 Try Deezer FLAC' : '🔄 Try Apple Music ALAC';
-  keyboard.push([
-    { text: switchLabel, callback_data: 'switch_engine' },
-    { text: '❌ Cancel', callback_data: 'cancel' },
-  ]);
+  if (navRow.length === 0) {
+    navRow.push({ text: '❌', callback_data: 'cancel' });
+    navRow.push({ text: '➡️', callback_data: 'bot_next' });
+  }
 
-  return keyboard;
+  return [numRow, navRow];
 }
 
 /**
  * Edits a picker message seamlessly using Telegram Bot API (if bot token configured)
  * or MTProto user client fallback.
  */
-async function editMenuMessage(client, channelEntity, menuMsgId, text, replyMarkup = null) {
+async function editMenuMessage(client, channelEntity, menuMsgId, text, replyMarkup = null, parseMode = null) {
   const BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
   if (BOT_TOKEN) {
     try {
@@ -259,8 +145,10 @@ async function editMenuMessage(client, channelEntity, menuMsgId, text, replyMark
         chat_id: tgChatId,
         message_id: menuMsgId,
         text,
-        parse_mode: 'Markdown',
       };
+      if (parseMode) {
+        payload.parse_mode = parseMode;
+      }
       if (replyMarkup) {
         payload.reply_markup = replyMarkup;
       }
@@ -411,85 +299,46 @@ async function cancelPicker(client, channelEntity) {
   return true;
 }
 
-async function switchPickerPage(client, channelEntity, newPage) {
+async function navigateBotPicker(client, channelEntity, direction) {
   if (!channelEntity) return false;
   const channelId = utils.getPeerId(channelEntity).toString();
   const session = activePickers.get(channelId);
-  if (!session) return false;
-
-  const pageSize = 5;
-  const totalPages = Math.ceil((session.candidates || []).length / pageSize) || 1;
-  const page = Math.min(Math.max(newPage, 1), totalPages);
-  session.page = page;
-
-  const menuText = formatPickerMenu(session.query, session.candidates, session.engine, page);
-  const keyboard = buildInlineKeyboard(session.candidates, session.engine, page);
-
-  await editMenuMessage(client, channelEntity, session.menuMsgId, menuText, { inline_keyboard: keyboard });
-  return true;
-}
-
-async function switchPickerEngine(client, channelEntity) {
-  if (!channelEntity) return false;
-  const channelId = utils.getPeerId(channelEntity).toString();
-  const session = activePickers.get(channelId);
-  if (!session) return false;
-
-  const newEngine = session.engine === 'applemusic' ? 'musicshunters' : 'applemusic';
-  const newEngineLabel = newEngine === 'applemusic' ? 'Apple Music ALAC' : 'Deezer / Qobuz FLAC';
-
-  await editMenuMessage(client, channelEntity, session.menuMsgId, `🔍 **Searching ${newEngineLabel} for "${session.query}"...**`);
-
-  let candidates = [];
-  let searchMsg = null;
+  if (!session || !session.searchMsg) return false;
 
   try {
-    if (newEngine === 'applemusic') {
-      const appleResults = await searchAppleMusic(session.query, 'IN', 20);
-      if (appleResults.length > 0) {
-        const scored = appleResults
-          .map(c => ({ ...c, score: scoreAppleMusicCandidate(c, session.query) }))
-          .sort((a, b) => b.score - a.score)
-          .slice(0, 10)
-          .map((c, idx) => ({
-            optionNum: idx + 1,
-            artist: c.artist,
-            title: c.title,
-            durationStr: c.durationStr,
-            url: c.url,
-          }));
-        candidates = scored;
-      }
-    } else {
-      const result = await searchMusicsHunters(client, session.query);
-      if (result && result.candidates.length > 0) {
-        candidates = result.candidates.slice(0, 10);
-        searchMsg = result.searchMsg;
-      }
-    }
-  } catch (err) {
-    console.warn(`[Downloader] Switch to ${newEngine} failed:`, err.message);
-  }
+    // Click the ➡️ or ⬅️ button on @MusicsHuntersbot
+    await session.searchMsg.click({ text: direction });
 
-  if (candidates.length === 0) {
-    await editMenuMessage(client, channelEntity, session.menuMsgId, `⚠️ No tracks found on ${newEngineLabel} for "${session.query}".`);
-    setTimeout(async () => {
-      const menuText = formatPickerMenu(session.query, session.candidates, session.engine, session.page || 1);
-      const keyboard = buildInlineKeyboard(session.candidates, session.engine, session.page || 1);
-      await editMenuMessage(client, channelEntity, session.menuMsgId, menuText, { inline_keyboard: keyboard });
-    }, 2500);
+    // Wait for @MusicsHuntersbot to update the message
+    await new Promise((r) => setTimeout(r, 1800));
+
+    // Fetch the updated searchMsg
+    const updated = await client.getMessages(session.searchMsg.peerId, { ids: [session.searchMsg.id] });
+    if (!updated || !updated[0]) return false;
+
+    session.searchMsg = updated[0];
+    const newCandidates = parseBotSearchResults(session.searchMsg.message);
+    if (newCandidates.length > 0) {
+      session.candidates = newCandidates;
+    }
+
+    // Extract page number from header e.g. from 'deezer':2
+    const pageMatch = session.searchMsg.message.match(/:(\d+)\s*$/m);
+    if (pageMatch) {
+      session.page = parseInt(pageMatch[1], 10);
+    } else {
+      session.page = direction === '➡️' ? (session.page || 1) + 1 : Math.max(1, (session.page || 1) - 1);
+    }
+
+    const menuText = formatPickerMenu(session.query, session.candidates, 'deezer', session.page);
+    const keyboard = buildMusicsHuntersKeyboard(session.candidates, session.searchMsg);
+
+    await editMenuMessage(client, channelEntity, session.menuMsgId, menuText, { inline_keyboard: keyboard }, 'Markdown');
+    return true;
+  } catch (err) {
+    console.warn('[Downloader] navigateBotPicker failed:', err.message);
     return false;
   }
-
-  session.engine = newEngine;
-  session.candidates = candidates;
-  session.searchMsg = searchMsg;
-  session.page = 1;
-
-  const menuText = formatPickerMenu(session.query, candidates, newEngine, 1);
-  const keyboard = buildInlineKeyboard(candidates, newEngine, 1);
-  await editMenuMessage(client, channelEntity, session.menuMsgId, menuText, { inline_keyboard: keyboard });
-  return true;
 }
 
 async function handlePickerChoice(client, channelEntity, optionNum, onTrackForwarded = null) {
@@ -501,21 +350,19 @@ async function handlePickerChoice(client, channelEntity, optionNum, onTrackForwa
   clearTimeout(session.timer);
   activePickers.delete(channelId);
 
-  const candidate = session.candidates[optionNum - 1] || session.candidates[0];
+  const candidate = session.candidates.find(c => c.optionNum === optionNum) || session.candidates[0];
   const candTitle = candidate?.title ? `"${candidate.title}"` : `Option ${optionNum}`;
 
   const updateStatus = async (msg) => {
-    await editMenuMessage(client, channelEntity, session.menuMsgId, msg);
+    await editMenuMessage(client, channelEntity, session.menuMsgId, msg, null, 'Markdown');
   };
 
   try {
-    await updateStatus(`⏳ **Downloading ${candTitle} in Lossless...**`);
+    await updateStatus(`⏳ **Downloading ${candTitle} in Lossless FLAC...**`);
 
     let audioDocMsg = null;
-    if (session.engine === 'musicshunters' && session.searchMsg) {
+    if (session.searchMsg) {
       audioDocMsg = await downloadMusicsHuntersDocument(client, session.searchMsg, optionNum, updateStatus);
-    } else if (candidate?.url) {
-      audioDocMsg = await downloadFromAppleMusic(client, candidate.url, updateStatus);
     } else {
       throw new Error(`Invalid candidate selection for option ${optionNum}`);
     }
@@ -565,16 +412,16 @@ async function handlePickerChoice(client, channelEntity, optionNum, onTrackForwa
 }
 
 /**
- * Handles `/song ...` channel command.
- * Supports direct URLs, explicit option numbers (`/song <query> <num>`),
- * and interactive 5-option selection menus (`/song <query>`).
+ * Handles `/song ...` or `/s ...` channel command.
+ * Supports direct URLs, explicit option numbers (`/s <query> <num>`),
+ * and interactive 7-option selection menus (`/s <query>`).
  */
 async function handleSongCommand(client, channelEntity, commandText, originalMsgId = null, onTrackForwarded = null) {
   const text = commandText.trim();
-  const match = text.match(/^\/song(?:\s+(.+))?$/i);
+  const match = text.match(/^\/(?:song|s)(?:\s+(.+))?$/i);
   if (!match || !match[1]) {
     const helpMsg = await client.sendMessage(channelEntity, {
-      message: 'ℹ️ **Usage:**\n• `/song <song name>` (shows top 5 choices)\n• `/song <song name> <option#>` (e.g. `/song Kesariya 2`)\n• `/song <Apple Music / Spotify URL>`'
+      message: 'ℹ️ **Usage:**\n• `/s <song name>` or `/song <song name>` (browses 7 choices)\n• `/s <song name> <option#>` (e.g. `/s Kesariya 2`)\n• `/s <Spotify / Deezer / Tidal URL>`'
     });
     setTimeout(() => {
       client.deleteMessages(channelEntity, [helpMsg.id, originalMsgId].filter(Boolean), { revoke: true }).catch(() => {});
@@ -606,86 +453,42 @@ async function handleSongCommand(client, channelEntity, commandText, originalMsg
   try {
     let audioDocMsg = null;
 
-    // CASE 1: Direct Apple Music URL
-    if (/music\.apple\.com/i.test(queryArg)) {
-      await updateStatus(`📥 **Downloading Studio ALAC Lossless** via @applemusicdw_bot...`);
-      audioDocMsg = await downloadFromAppleMusic(client, queryArg, updateStatus);
-    }
-    // CASE 2: Direct Spotify / Deezer / Qobuz / Tidal URL
-    else if (/^(https?:\/\/)?(open\.spotify\.com|deezer\.com|deezer\.page\.link|qobuz\.com|tidal\.com)/i.test(queryArg)) {
+    // CASE 1: Direct Spotify / Deezer / Qobuz / Tidal / Apple Music URL
+    if (/^(https?:\/\/)?(open\.spotify\.com|deezer\.com|deezer\.page\.link|qobuz\.com|tidal\.com|music\.apple\.com)/i.test(queryArg)) {
       await updateStatus(`📥 **Downloading FLAC** via @MusicsHuntersbot...`);
       audioDocMsg = await downloadFromMusicsHunters(client, queryArg, 1, updateStatus);
     }
-    // CASE 3: Keyword search with explicit option number (e.g. "/song Kesariya 2")
+    // CASE 2: Keyword search with explicit option number (e.g. "/s Kesariya 2")
     else if (/^(.+?)\s+([1-9]\d?)$/.test(queryArg)) {
       const numMatch = queryArg.match(/^(.+?)\s+([1-9]\d?)$/);
       const query = numMatch[1].trim();
       const requestedOption = parseInt(numMatch[2], 10);
 
       await updateStatus(`🔍 Downloading Option ${requestedOption} for **"${query}"** in Lossless FLAC...`);
-      try {
-        audioDocMsg = await downloadFromMusicsHunters(client, query, requestedOption, updateStatus);
-      } catch (flacErr) {
-        console.warn('[Downloader] @MusicsHuntersbot failed, trying Apple Music fallback:', flacErr.message);
-        await updateStatus(`⚠️ Deezer busy, checking Apple Music...`);
-        const candidates = await searchAppleMusic(query);
-        if (candidates.length >= requestedOption) {
-          const selected = candidates[requestedOption - 1];
-          audioDocMsg = await downloadFromAppleMusic(client, selected.url, updateStatus);
-        } else if (candidates.length > 0) {
-          audioDocMsg = await downloadFromAppleMusic(client, candidates[0].url, updateStatus);
-        } else {
-          throw flacErr;
-        }
-      }
+      audioDocMsg = await downloadFromMusicsHunters(client, query, requestedOption, updateStatus);
     }
-    // CASE 4: Standard keyword search -> Render interactive 5-option picker menu
+    // CASE 3: Standard keyword search on Deezer (@MusicsHuntersbot)
     else {
-      let engine = 'musicshunters';
+      let engine = 'deezer';
       let searchResult = null;
       let candidates = [];
 
       try {
         searchResult = await searchMusicsHunters(client, queryArg, updateStatus);
         if (searchResult && searchResult.candidates.length > 0) {
-          if (areCandidatesRelevant(searchResult.candidates, queryArg)) {
-            candidates = searchResult.candidates;
-          } else {
-            console.log(`[Downloader] @MusicsHuntersbot results failed relevance check for "${queryArg}", falling back to Apple Music...`);
-          }
+          candidates = searchResult.candidates;
         }
       } catch (botErr) {
         console.warn('[Downloader] @MusicsHuntersbot search failed:', botErr.message);
       }
 
-      // If bot returned no candidates, fall back to Apple Music search
       if (candidates.length === 0) {
-        engine = 'applemusic';
-        await updateStatus(`🔍 Searching Apple Music catalog for **"${queryArg}"**...`);
-        const appleResults = await searchAppleMusic(queryArg, 'IN', 20);
-        if (appleResults.length > 0) {
-          const scored = appleResults
-            .map(c => ({ ...c, score: scoreAppleMusicCandidate(c, queryArg) }))
-            .sort((a, b) => b.score - a.score)
-            .slice(0, 10)
-            .map((c, idx) => ({
-              optionNum: idx + 1,
-              artist: c.artist,
-              title: c.title,
-              durationStr: c.durationStr,
-              url: c.url,
-            }));
-          candidates = scored;
-        }
+        throw new Error(`No tracks found for "${queryArg}" on Deezer`);
       }
 
-      if (candidates.length === 0) {
-        throw new Error(`No tracks found for "${queryArg}" on Deezer or Apple Music`);
-      }
-
-      // Render interactive selection menu (Page 1)
+      // Render interactive selection menu matching reference screenshot
       const menuText = formatPickerMenu(queryArg, candidates, engine, 1);
-      const keyboard = buildInlineKeyboard(candidates, engine, 1);
+      const keyboard = buildMusicsHuntersKeyboard(candidates, searchResult?.searchMsg);
       const BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
       let menuMsgId = statusMsg.id;
 
@@ -787,22 +590,18 @@ async function handleSongCommand(client, channelEntity, commandText, originalMsg
 }
 
 module.exports = {
-  searchAppleMusic,
-  scoreAppleMusicCandidate,
-  downloadFromAppleMusic,
   downloadFromMusicsHunters,
   handleSongCommand,
   parseBotSearchResults,
   formatPickerMenu,
-  buildInlineKeyboard,
+  buildMusicsHuntersKeyboard,
   searchMusicsHunters,
   downloadMusicsHuntersDocument,
   hasActivePicker,
   isPickerMenu,
   handlePickerChoice,
   cancelPicker,
-  switchPickerPage,
-  switchPickerEngine,
+  navigateBotPicker,
   areCandidatesRelevant,
 };
 

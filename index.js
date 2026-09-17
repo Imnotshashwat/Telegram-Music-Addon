@@ -16,8 +16,7 @@ const {
   isPickerMenu,
   handlePickerChoice,
   cancelPicker,
-  switchPickerPage,
-  switchPickerEngine,
+  navigateBotPicker,
 } = require('./downloader');
 
 const app = express();
@@ -1368,17 +1367,27 @@ async function resolveChannel() {
   return await client.getEntity(cleanInput);
 }
 
-const SYSTEM_PREFIXES = ['🎧', '🔍', '⏳', '🚀', '✅', '❌', 'ℹ️', '🧹', '⚠️'];
+const SYSTEM_PREFIXES = ['Searching for', '🎧', '🔍', '⏳', '🚀', '✅', '❌', 'ℹ️', '🧹', '⚠️'];
 
-function isFromBot(msg) {
-  const token = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
-  const botId = token ? token.split(':')[0] : null;
-  if (!botId) return false;
+async function isFromBot(msg) {
+  if (!msg) return false;
   try {
-    if (msg.fromId && utils.getPeerId(msg.fromId).toString() === botId) return true;
-    if (msg.senderId && msg.senderId.toString() === botId) return true;
-    if (msg.viaBotId && msg.viaBotId.toString() === botId) return true;
-    if (msg.sender && (msg.sender.id?.toString() === botId || msg.sender.bot)) return true;
+    if (msg.viaBotId) return true;
+    if (msg.replyMarkup) return true; // Only bots can attach replyMarkup (inline buttons) in Telegram
+    if (msg.sender?.bot) return true;
+
+    const token = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+    const botId = token ? token.split(':')[0] : null;
+    if (botId) {
+      if (msg.fromId && utils.getPeerId(msg.fromId).toString() === botId) return true;
+      if (msg.senderId && msg.senderId.toString() === botId) return true;
+    }
+
+    if (typeof msg.getSender === 'function') {
+      const sender = await msg.getSender();
+      if (sender?.bot) return true;
+      if (botId && sender?.id?.toString() === botId) return true;
+    }
   } catch (_) {}
   return false;
 }
@@ -1404,15 +1413,13 @@ async function startBotCallbackPoller(botToken) {
 
           if (cq.data === 'cancel') {
             await cancelPicker(client, channelEntity);
-          } else if (cq.data === 'page_1') {
-            await switchPickerPage(client, channelEntity, 1);
-          } else if (cq.data === 'page_2') {
-            await switchPickerPage(client, channelEntity, 2);
-          } else if (cq.data === 'switch_engine') {
-            await switchPickerEngine(client, channelEntity);
+          } else if (cq.data === 'bot_next') {
+            await navigateBotPicker(client, channelEntity, '➡️');
+          } else if (cq.data === 'bot_prev') {
+            await navigateBotPicker(client, channelEntity, '⬅️');
           } else {
             const opt = parseInt(cq.data, 10);
-            if (!isNaN(opt) && opt >= 1 && opt <= 10) {
+            if (!isNaN(opt)) {
               await handlePickerChoice(client, channelEntity, opt, onTrackForwarded);
             }
           }
@@ -1450,8 +1457,8 @@ async function startBotCallbackPoller(botToken) {
         const isSelfChat = message.isPrivate; // e.g. Saved Messages
         const trimmedText = (message.text || message.message || '').trim();
 
-        // 1. Check for /song command
-        if (trimmedText.startsWith('/song')) {
+        // 1. Check for /song or /s command
+        if (/^\/(?:song|s)(?:\s+.*)?$/i.test(trimmedText)) {
           if (isMusicChannel || isSelfChat) {
             console.log(`[Song Command] Detected: "${trimmedText}" (msg ID: ${message.id})`);
             handleSongCommand(client, channelEntity, trimmedText, message.id, onTrackForwarded).catch((err) => {
@@ -1461,8 +1468,8 @@ async function startBotCallbackPoller(botToken) {
           }
         }
 
-        // 2. Check for interactive picker choice (/1 to /10)
-        const pickerMatch = trimmedText.match(/^\/(10|[1-9])$/);
+        // 2. Check for interactive picker choice (/1, /2, /8, /15, etc.)
+        const pickerMatch = trimmedText.match(/^\/(\d+)$/);
         if (pickerMatch && hasActivePicker(channelEntity)) {
           if (isMusicChannel || isSelfChat) {
             const choice = parseInt(pickerMatch[1], 10);
@@ -1474,27 +1481,19 @@ async function startBotCallbackPoller(botToken) {
           }
         }
 
-        // 3. Check for /next, /prev, /switch navigation commands
-        if ((trimmedText === '/next' || trimmedText === '/more') && hasActivePicker(channelEntity)) {
+        // 3. Check for /next, /prev navigation commands
+        if ((trimmedText === '/next' || trimmedText === '/more' || trimmedText === '➡️') && hasActivePicker(channelEntity)) {
           if (isMusicChannel || isSelfChat) {
             client.deleteMessages(channelEntity, [message.id], { revoke: true }).catch(() => {});
-            switchPickerPage(client, channelEntity, 2).catch(() => {});
+            navigateBotPicker(client, channelEntity, '➡️').catch(() => {});
             return;
           }
         }
 
-        if (trimmedText === '/prev' && hasActivePicker(channelEntity)) {
+        if ((trimmedText === '/prev' || trimmedText === '⬅️') && hasActivePicker(channelEntity)) {
           if (isMusicChannel || isSelfChat) {
             client.deleteMessages(channelEntity, [message.id], { revoke: true }).catch(() => {});
-            switchPickerPage(client, channelEntity, 1).catch(() => {});
-            return;
-          }
-        }
-
-        if ((trimmedText === '/switch' || trimmedText === '/engine') && hasActivePicker(channelEntity)) {
-          if (isMusicChannel || isSelfChat) {
-            client.deleteMessages(channelEntity, [message.id], { revoke: true }).catch(() => {});
-            switchPickerEngine(client, channelEntity).catch(() => {});
+            navigateBotPicker(client, channelEntity, '⬅️').catch(() => {});
             return;
           }
         }
@@ -1522,15 +1521,15 @@ async function startBotCallbackPoller(botToken) {
         }
 
         // 5. Auto-purge channel cleaner: delete any incoming non-music chatter/spam from users
-        if (isMusicChannel && !message.out) {
+        if (isMusicChannel && !message.out && !message.post) {
           const isCommand = trimmedText.startsWith('/');
           const hasButtons = Boolean(message.replyMarkup);
-          const isBotSender = isFromBot(message);
+          const isBotSender = await isFromBot(message);
           const isSystemText = SYSTEM_PREFIXES.some(p => trimmedText.startsWith(p));
           const isPicker = isPickerMenu(channelEntity, message.id);
 
           if (!isCommand && !hasButtons && !isBotSender && !isSystemText && !isPicker) {
-            console.log(`[Channel Cleaner] Auto-purging non-music message (msg ID: ${message.id}): "${trimmedText.slice(0, 30)}"`);
+            console.log(`[Channel Cleaner] Auto-purging user non-music message (msg ID: ${message.id}): "${trimmedText.slice(0, 30)}"`);
             client.deleteMessages(channelEntity, [message.id], { revoke: true }).catch(() => {});
           }
         }

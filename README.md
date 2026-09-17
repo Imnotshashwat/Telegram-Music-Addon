@@ -11,39 +11,65 @@ BitChord searches this server whenever a track is requested. If the track is pre
 - **Title and artist matching**: Normalizes song titles and splits multi-artist tags to match queries from YouTube Music.
 - **Quality deduplication**: Keeps track of bit depth, sample rate, and container formats, silently retaining higher-quality copies when duplicates are added without cluttering the channel.
 - **`/keep` protection flag**: Add `/keep` or `#keep` in an audio caption to bypass deduplication and preserve multiple editions or cuts of the same song.
-- **Interactive 5-option song search**: Type `/song <name>` in your channel to browse the top 5 results from downloader bots, then tap `/1` through `/5` to download directly in lossless FLAC.
-- **Automatic channel cleaner**: Auto-purges incoming text chat, photos, stickers, and spam from the channel while keeping audio files and slash commands.
-- **Silent operation**: Automatic cleanup and quality upgrades happen silently in the background with zero channel spam.
+- **Interactive 7-track search**: Type `/s <name>` or `/song <name>` to browse 7 results per page with duration highlights, inline buttons `[ 1 ]`..`[ 7 ]`, and live paging (`[ ⬅️ ] [ ❌ ] [ ➡️ ]`).
+- **User chatter auto-cleaner**: Purges casual chat, photos, stickers, and spam sent by regular users while keeping audio files, bot menus, and slash commands safe.
+- **Silent operation**: Cleanup and quality upgrades happen in the background without channel spam.
 
 ## Why Telegram instead of Google Drive
 
-Using Telegram channels as a cloud music vault offers distinct advantages over Google Drive for personal streaming:
+Using a Telegram channel as your music vault gives you several practical benefits over Google Drive:
 
-- **Uncapped storage for free**: Google Drive limits free accounts to 15 GB total across Drive, Gmail, and Google Photos. Lossless CD and 24-bit Hi-Res FLAC tracks typically run 30 MB to 100 MB each, meaning a 15 GB tier fills up in roughly 200 to 300 songs. Telegram provides free cloud storage across channels with no total account cap, letting you store thousands of FLAC tracks without monthly subscription fees. Individual files can be up to 2 GB (4 GB with Telegram Premium).
-- **No daily download quotas or 24-hour bans**: Google Drive regularly flags frequent streaming and seeking with "Download quota exceeded for this file", locking playback for up to 24 hours. Telegram MTProto imposes no daily download quotas on your personal channel files.
-- **Low-latency byte-range streaming (RFC 7233)**: Telegram's MTProto protocol allows pulling exact 64KB to 512KB slices on demand (`client.iterDownload`). This gives Android ExoPlayer instant seeking response without the overhead of OAuth2 token refreshes and REST redirects.
-- **Direct in-chat bot automation**: Telegram allows interacting with music search bots (`@MusicsHuntersbot` and `@applemusicdw_bot`) directly within the channel, downloading tracks into your vault without running separate local download scripts.
+- **Free storage without account caps**: Google Drive limits free accounts to 15 GB shared across Drive, Gmail, and Google Photos. Lossless CD and 24-bit Hi-Res FLAC files run 30 MB to 100 MB each, so a 15 GB tier fills up after 200 to 300 songs. Telegram provides cloud storage across channels with no total account cap, letting you store thousands of FLAC tracks without monthly fees. Individual files can be up to 2 GB (4 GB with Telegram Premium).
+- **No daily download quotas**: Google Drive flags frequent streaming and seeking with "Download quota exceeded for this file", locking playback for up to 24 hours. Telegram MTProto has no daily download quotas on your channel files.
+- **Low-latency byte-range streaming (RFC 7233)**: Telegram's MTProto protocol pulls exact 64KB to 512KB slices on demand (`client.iterDownload`). This gives ExoPlayer fast seeking without OAuth2 token refreshes or redirect delays.
+- **In-channel bot downloads**: You can search and download tracks via `@MusicsHuntersbot` directly in your channel without running local download scripts.
 
 > [!WARNING]
-> **Keep your channel Private:** Always set your storage channel type to **Private** (accessed via numeric channel ID or invite link, not a public `@username`). Public channels are indexed by global search engines and monitored by automated record label crawlers (IFPI, Sony, T-Series), which can trigger copyright takedown bans. Private channels are not indexed and function safely as personal cloud storage.
+> **Keep your channel Private:** Always set your storage channel to **Private** (using an invite link or numeric channel ID, not a public `@username`). Public channels are indexed by search engines and monitored by automated record label copyright bots, which can lead to copyright takedowns. Private channels are not indexed and remain safe for personal storage.
 
 ## Channel commands and music search
 
-### `/song` Downloader
-The addon monitors your music channel for `/song` commands and downloads tracks directly into your vault:
+### Song Search and Downloads (`/s` or `/song`)
+The addon listens for `/s` or `/song` commands in your channel and downloads tracks in lossless FLAC:
 
-- **Interactive Search with Pagination (10 Results):** Type `/song <song name>` (e.g. `/song brown rang`). TeleMusic queries `@MusicsHuntersbot` (Deezer/Qobuz FLAC) with relevance verification and Apple Music fallback (`@applemusicdw_bot`).
-  - **With Bot Token (`TELEGRAM_BOT_TOKEN`):** Displays real Telegram inline UI buttons `[ 1️⃣ ] [ 2️⃣ ] [ 3️⃣ ] [ 4️⃣ ] [ 5️⃣ ]`, `[ ➡️ Next (6-10) ]`, `[ 🔄 Switch Catalog ]`, and `[ ❌ Cancel ]` directly under the message. Tapping Next flips in-place to options 6–10.
-  - **Without Bot Token (Default):** Displays direct command links (`/1` through `/10`), plus `/next`, `/prev`, `/switch`, and `/cancel`.
-- **One-Tap Catalog Switch:** If Deezer results don't have what you want, tap `[ 🔄 Try Apple Music ALAC ]` (or send `/switch`) to search Apple Music's 100M+ lossless library. No links needed—TeleMusic queries Apple's catalog API automatically.
-- **Direct Option Selection:** Skip the menu by specifying the number directly: `/song Kesariya 2`.
-- **Direct Link Downloads:** Paste streaming links directly: `/song https://open.spotify.com/track/...` or Apple Music / Deezer / Tidal URLs. TeleMusic downloads the exact track in Studio Lossless.
+- **Interactive 7-Track Search:** Send `/s <song name>` or `/song <song name>` (for example, `/s brown rang`). TeleMusic searches Deezer through `@MusicsHuntersbot`:
+  ```text
+  🎧 Search Results for: "brown rang" [Deezer FLAC]
+
+  1. Boogaloo Joe Jones - Brown Bag (5:07)
+  2. Nizi19 - Browning (1:45)
+  3. Van Morrison - Brown-Eyed Girl (3:03)
+  4. The King's Noyse - Browning (4:45)
+  5. Jean-Claude Vannier - Browning (3:14)
+  6. ...
+  7. ...
+  ```
+  - **Highlighted Durations:** Track durations appear in monospace code bubbles so they are easy to distinguish from song titles.
+  - **Inline Buttons (`TELEGRAM_BOT_TOKEN`):** If a bot token is configured, TeleMusic adds square buttons `[ 1 ]` to `[ 7 ]` and navigation buttons `[ ⬅️ ] [ ❌ ] [ ➡️ ]` under the message.
+  - **Live Paging:** Tapping `➡️` or `⬅️` sends a click to `@MusicsHuntersbot` in the background, loads the next 7 tracks (like tracks 8 to 14 on page 2), and updates the message in place.
+  - **Direct Download:** Tapping any number button (or typing `/1` to `/14`) downloads that track in lossless FLAC directly to your channel.
+- **Direct Option Selection:** Skip the search menu by adding the number directly: `/s Kesariya 2` or `/song Kesariya 2`.
+- **Direct Link Downloads:** Paste streaming links directly: `/s https://open.spotify.com/track/...` or Deezer, Tidal, or Qobuz URLs. TeleMusic downloads the track in original FLAC.
+
+### Setting Up Inline Buttons with a Personal Bot
+Telegram user accounts cannot post messages with inline keyboard buttons into channels. Connecting a personal bot lets TeleMusic attach clickable buttons under search results:
+
+1. Open Telegram and message [@BotFather](https://t.me/BotFather).
+2. Send `/newbot`, name your bot (for example, `MyMusicBot`), and give it a unique username ending in `bot` (for example, `my_music_vault_bot`).
+3. Copy the HTTP API token BotFather gives you.
+4. Add the token to your `.env` file (and in your cloud environment variables):
+   ```env
+   TELEGRAM_BOT_TOKEN="1234567890:ABCdefGHIjklMNOpqrsTUVwxyz"
+   ```
+5. Open your private music channel settings, go to **Administrators** > **Add Administrator**, search for your bot username, and turn on **Post Messages** and **Edit Messages** permissions.
+6. Start the server (`npm start`). TeleMusic will now post search menus with inline buttons and process callback clicks.
 
 ### `/keep` Caption Flag
-If you intentionally want to keep multiple versions of a song (for example, a 16-bit FLAC alongside a 320kbps MP3 or a specific radio edit), include `/keep`, `#keep`, or `/ig` in the caption when uploading. The deduplication engine recognizes this tag and preserves both files permanently.
+If you want to keep multiple versions of a song (such as a 16-bit FLAC alongside a 320kbps MP3 or a radio edit), include `/keep`, `#keep`, or `/ig` in the caption when uploading. The deduplication check will skip the file and keep both copies.
 
-### Automatic Channel Cleaner
-The channel listener automatically purges non-music clutter (casual text chat, photos, stickers, GIFs, regular videos, and spam links) to keep the music library clean. Audio files and commands beginning with `/` are preserved.
+### User Chatter Auto-Cleaner
+The channel listener removes casual chat messages, photos, stickers, GIFs, regular videos, and spam links sent by regular users.
+- **Bot and System Immunity:** Messages from bots, menus with buttons, channel admin posts, system status updates, slash commands (`/`), and audio files are never deleted.
 
 ## How it works
 

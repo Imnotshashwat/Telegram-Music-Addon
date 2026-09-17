@@ -64,6 +64,20 @@ The script writes your credentials to `.env`.
    * You can add `/keep` or `#keep` in the upload caption to exempt a track from duplicate removal.
    * The server automatically indexes new files as soon as they appear in the channel.
 
+## 3.1 (Optional) Add a bot for inline buttons
+
+Telegram user accounts cannot attach inline keyboard buttons in channels. If you want clickable square buttons (`[ 1 ]` to `[ 7 ]` and `[ ⬅️ ] [ ❌ ] [ ➡️ ]`) directly under search results:
+
+1. Open Telegram and message [@BotFather](https://t.me/BotFather).
+2. Type `/newbot` and follow the prompts to choose a name and username (for example, `MyMusicBot`).
+3. Copy the HTTP API token BotFather gives you.
+4. Add the token to `.env`:
+   ```env
+   TELEGRAM_BOT_TOKEN="1234567890:ABCdefGHIjklMNOpqrsTUVwxyz"
+   ```
+5. Open your channel settings, go to **Administrators** > **Add Administrator**, search for your bot username, and grant **Post Messages** and **Edit Messages** permissions.
+6. When TeleMusic runs, it will post search results using this bot and handle button clicks in the background.
+
 ## 4. Run locally
 
 ```bash
