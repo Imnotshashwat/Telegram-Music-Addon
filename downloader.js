@@ -389,6 +389,13 @@ function hasActivePicker(channelEntity) {
   return activePickers.has(channelId);
 }
 
+function isPickerMenu(channelEntity, messageId) {
+  if (!channelEntity || !messageId) return false;
+  const channelId = utils.getPeerId(channelEntity).toString();
+  const session = activePickers.get(channelId);
+  return Boolean(session && session.menuMsgId === messageId);
+}
+
 async function cancelPicker(client, channelEntity) {
   if (!channelEntity) return false;
   const channelId = utils.getPeerId(channelEntity).toString();
@@ -791,6 +798,7 @@ module.exports = {
   searchMusicsHunters,
   downloadMusicsHuntersDocument,
   hasActivePicker,
+  isPickerMenu,
   handlePickerChoice,
   cancelPicker,
   switchPickerPage,

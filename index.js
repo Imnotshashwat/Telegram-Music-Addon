@@ -13,6 +13,7 @@ const mm = require('music-metadata');
 const {
   handleSongCommand,
   hasActivePicker,
+  isPickerMenu,
   handlePickerChoice,
   cancelPicker,
   switchPickerPage,
@@ -1367,6 +1368,21 @@ async function resolveChannel() {
   return await client.getEntity(cleanInput);
 }
 
+const SYSTEM_PREFIXES = ['🎧', '🔍', '⏳', '🚀', '✅', '❌', 'ℹ️', '🧹', '⚠️'];
+
+function isFromBot(msg) {
+  const token = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+  const botId = token ? token.split(':')[0] : null;
+  if (!botId) return false;
+  try {
+    if (msg.fromId && utils.getPeerId(msg.fromId).toString() === botId) return true;
+    if (msg.senderId && msg.senderId.toString() === botId) return true;
+    if (msg.viaBotId && msg.viaBotId.toString() === botId) return true;
+    if (msg.sender && (msg.sender.id?.toString() === botId || msg.sender.bot)) return true;
+  } catch (_) {}
+  return false;
+}
+
 async function startBotCallbackPoller(botToken) {
   let offset = 0;
   console.log('[Bot Poller] Active for real inline buttons.');
@@ -1505,11 +1521,16 @@ async function startBotCallbackPoller(botToken) {
           return;
         }
 
-        // 5. Auto-purge channel cleaner: delete any incoming non-music messages from users
+        // 5. Auto-purge channel cleaner: delete any incoming non-music chatter/spam from users
         if (isMusicChannel && !message.out) {
           const isCommand = trimmedText.startsWith('/');
-          if (!isCommand) {
-            console.log(`[Channel Cleaner] Auto-purging non-music message (msg ID: ${message.id})`);
+          const hasButtons = Boolean(message.replyMarkup);
+          const isBotSender = isFromBot(message);
+          const isSystemText = SYSTEM_PREFIXES.some(p => trimmedText.startsWith(p));
+          const isPicker = isPickerMenu(channelEntity, message.id);
+
+          if (!isCommand && !hasButtons && !isBotSender && !isSystemText && !isPicker) {
+            console.log(`[Channel Cleaner] Auto-purging non-music message (msg ID: ${message.id}): "${trimmedText.slice(0, 30)}"`);
             client.deleteMessages(channelEntity, [message.id], { revoke: true }).catch(() => {});
           }
         }
