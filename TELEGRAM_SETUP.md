@@ -76,7 +76,19 @@ Telegram user accounts cannot attach inline keyboard buttons in channels. If you
    TELEGRAM_BOT_TOKEN="1234567890:ABCdefGHIjklMNOpqrsTUVwxyz"
    ```
 5. Open your channel settings, go to **Administrators** > **Add Administrator**, search for your bot username, and grant **Post Messages** and **Edit Messages** permissions.
-6. When TeleMusic runs, it will post search results using this bot and handle button clicks in the background.
+6. When the addon runs, it will post search results using this bot and handle button clicks in the background.
+
+## 3.2 Set @MusicsHuntersbot quality to FLAC / Hi-Res (one-time setup)
+
+The addon downloads whatever audio quality your chat with `@MusicsHuntersbot` is currently set to. If you haven't configured it yet, it might send MP3s instead of FLAC.
+
+1. Open a chat with [@MusicsHuntersbot](https://t.me/MusicsHuntersbot).
+2. Send `/start` if you haven't yet.
+3. Tap **Settings** (or send `/settings`).
+4. Pick **Lossless** or **Hi-Res** (FLAC 16-bit 44.1kHz or 24-bit).
+5. Telegram saves this preference for all future `/s` downloads.
+
+> **Playlists:** `/s` downloads one song at a time. To grab an entire playlist, send the link directly to `@MusicsHuntersbot` in your private chat.
 
 ## 4. Run locally
 

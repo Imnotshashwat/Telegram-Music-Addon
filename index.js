@@ -441,11 +441,22 @@ function normalizeTitle(t) {
   if (!t) return '';
   return t
     .toLowerCase()
-    .replace(/\((?:from|official|audio|video|lyrics|full song|remastered|hd|hq|club mix|feat\.?|ft\.?).*?\)/gi, '')
-    .replace(/\[(?:from|official|audio|video|lyrics|full song|remastered|hd|hq|club mix|feat\.?|ft\.?).*?\]/gi, '')
+    .replace(/\((?:from|official|audio|video|lyrics|full song|remastered|hd|hq|club mix|feat\.?|ft\.?|radio edit|clean|explicit).*?\)/gi, '')
+    .replace(/\[(?:from|official|audio|video|lyrics|full song|remastered|hd|hq|club mix|feat\.?|ft\.?|radio edit|clean|explicit).*?\]/gi, '')
+    .replace(/\s*[-–—]\s*(?:radio edit|original mix|single|clean|explicit|from\s+.*?)$/gi, '')
     .replace(/[^\w\s]/gi, '')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function getCoreTitle(str) {
+  if (!str) return '';
+  // If title has "Artist - SongName", take the right side
+  if (str.includes(' - ') || str.includes(' – ') || str.includes(' — ')) {
+    const parts = str.split(/\s+[-–—]+\s+/);
+    return normalizeTitle(parts[parts.length - 1]);
+  }
+  return normalizeTitle(str);
 }
 
 function normalizeArtist(a) {
@@ -460,23 +471,33 @@ function normalizeArtist(a) {
 function isDuplicate(a, b) {
   if (a.id === b.id) return false;
 
-  // Duration safeguard: if both tracks have known duration, they must match within 5 seconds
-  if (a.duration && b.duration && Math.abs(a.duration - b.duration) > 5) {
+  // Duration safeguard: if both tracks have known duration, allow up to 15s tolerance
+  if (a.duration && b.duration && Math.abs(a.duration - b.duration) > 15) {
     return false;
   }
 
   const titleA = normalizeTitle(a.title);
   const titleB = normalizeTitle(b.title);
+  const coreA = getCoreTitle(a.title);
+  const coreB = getCoreTitle(b.title);
+
   if (!titleA || !titleB) return false;
 
-  if (titleA === titleB) {
+  const titlesMatch = (titleA === titleB || coreA === coreB || titleA === coreB || coreA === titleB);
+  if (titlesMatch) {
     const artistA = normalizeArtist(a.artist);
     const artistB = normalizeArtist(b.artist);
     if (artistA && artistB) {
-      const wordsA = artistA.split(' ').filter((w) => w.length > 2);
-      const wordsB = artistB.split(' ').filter((w) => w.length > 2);
+      const wordsA = artistA.split(' ').filter((w) => w.length >= 2);
+      const wordsB = artistB.split(' ').filter((w) => w.length >= 2);
       const hasCommonArtist = wordsA.some((w) => artistB.includes(w)) || wordsB.some((w) => artistA.includes(w));
-      return hasCommonArtist;
+      if (hasCommonArtist) return true;
+
+      // When core title matches and duration is close (<= 6s), it's the same song
+      if (a.duration && b.duration && Math.abs(a.duration - b.duration) <= 6) {
+        return true;
+      }
+      return false;
     }
     return true;
   }
@@ -993,12 +1014,17 @@ async function onTrackForwarded(msg) {
   try {
     const track = await parseTrackMessage(msg);
     if (track) {
-      await processTrackUpload(track);
+      const processed = await processTrackUpload(track);
+      if (processed === null) {
+        return { discarded: true };
+      }
       console.log(`[AutoIndex] Successfully indexed newly uploaded track: "${track.title}" (ID: ${track.id})`);
+      return { indexed: true, track: processed };
     }
   } catch (err) {
     console.warn('[AutoIndex] Error indexing forwarded track:', err.message);
   }
+  return null;
 }
 
 // Search: BitChord calls /search?q=... to find tracks (100% in-memory for instant < 5ms response!)
@@ -1447,7 +1473,7 @@ async function startBotCallbackPoller(botToken) {
       startBotCallbackPoller(BOT_TOKEN);
     }
 
-    // Set up real-time listener for /song commands, picker choices, audio uploads, and auto-purge cleaner
+    // Set up real-time listener for /s commands, picker choices, audio uploads, and auto-purge cleaner
     client.addEventHandler(async (event) => {
       try {
         const message = event.message;
@@ -1457,8 +1483,8 @@ async function startBotCallbackPoller(botToken) {
         const isSelfChat = message.isPrivate; // e.g. Saved Messages
         const trimmedText = (message.text || message.message || '').trim();
 
-        // 1. Check for /song or /s command
-        if (/^\/(?:song|s)(?:\s+.*)?$/i.test(trimmedText)) {
+        // 1. Check for /s command
+        if (/^\/s(?:\s+.*)?$/i.test(trimmedText)) {
           if (isMusicChannel || isSelfChat) {
             console.log(`[Song Command] Detected: "${trimmedText}" (msg ID: ${message.id})`);
             handleSongCommand(client, channelEntity, trimmedText, message.id, onTrackForwarded).catch((err) => {

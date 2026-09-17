@@ -87,10 +87,10 @@ function formatPickerMenu(query, candidates, engine = 'deezer', page = 1) {
   const engineLabel = 'Deezer FLAC';
   const pageLabel = page > 1 ? ` • Page ${page}` : '';
   const cleanQuery = escapeMarkdown(query);
-  const header = `🎧 **Search Results for:** _"${cleanQuery}"_ \`[${engineLabel}${pageLabel}]\``;
+  const header = `🎧 **Search Results for:** _"${cleanQuery}"_ · [${engineLabel}${pageLabel}]`;
 
   const list = candidates.map((c) => {
-    const dur = c.durationStr ? ` \`(${c.durationStr})\`` : '';
+    const dur = c.durationStr ? ` (${c.durationStr})` : '';
     const artist = c.artist ? `${escapeMarkdown(c.artist)} - ` : '';
     const title = escapeMarkdown(c.title);
     return `${c.optionNum}. ${artist}${title}${dur}`;
@@ -310,7 +310,7 @@ async function navigateBotPicker(client, channelEntity, direction) {
     await session.searchMsg.click({ text: direction });
 
     // Wait for @MusicsHuntersbot to update the message
-    await new Promise((r) => setTimeout(r, 1800));
+    await new Promise((r) => setTimeout(r, 1000));
 
     // Fetch the updated searchMsg
     const updated = await client.getMessages(session.searchMsg.peerId, { ids: [session.searchMsg.id] });
@@ -378,15 +378,29 @@ async function handlePickerChoice(client, channelEntity, optionNum, onTrackForwa
       fromPeer: botPeer,
     });
 
-    if (onTrackForwarded && forwarded && forwarded[0]) {
+    let channelMsg = (forwarded && forwarded[0] && forwarded[0].id) ? forwarded[0] : null;
+    if (!channelMsg) {
+      // GramJS returns [undefined] for channel forwards — fetch the newly forwarded message from channel
+      const recent = await client.getMessages(channelEntity, { limit: 1 });
+      if (recent && recent[0] && recent[0].media?.document) {
+        channelMsg = recent[0];
+      }
+    }
+
+    let forwardResult = null;
+    if (onTrackForwarded && channelMsg) {
       try {
-        await onTrackForwarded(forwarded[0]);
+        forwardResult = await onTrackForwarded(channelMsg);
       } catch (idxErr) {
         console.warn('[Downloader] Post-forward indexing error:', idxErr.message);
       }
     }
 
-    await updateStatus(`✅ **Added ${candTitle} to Music Library!**`);
+    if (forwardResult && forwardResult.discarded) {
+      await updateStatus(`ℹ️ **${candTitle} is already in your library!** (Duplicate removed)`);
+    } else {
+      await updateStatus(`✅ **Added ${candTitle} to Music Library!**`);
+    }
 
     setTimeout(async () => {
       try {
@@ -411,17 +425,18 @@ async function handlePickerChoice(client, channelEntity, optionNum, onTrackForwa
   }
 }
 
+
 /**
- * Handles `/song ...` or `/s ...` channel command.
+ * Handles `/s` channel command.
  * Supports direct URLs, explicit option numbers (`/s <query> <num>`),
  * and interactive 7-option selection menus (`/s <query>`).
  */
 async function handleSongCommand(client, channelEntity, commandText, originalMsgId = null, onTrackForwarded = null) {
   const text = commandText.trim();
-  const match = text.match(/^\/(?:song|s)(?:\s+(.+))?$/i);
+  const match = text.match(/^\/s(?:\s+(.+))?$/i);
   if (!match || !match[1]) {
     const helpMsg = await client.sendMessage(channelEntity, {
-      message: 'ℹ️ **Usage:**\n• `/s <song name>` or `/song <song name>` (browses 7 choices)\n• `/s <song name> <option#>` (e.g. `/s Kesariya 2`)\n• `/s <Spotify / Deezer / Tidal URL>`'
+      message: 'ℹ️ **Usage:**\n• `/s <song name>` — browse 7 choices\n• `/s <Spotify / Deezer / Tidal URL>` — direct download'
     });
     setTimeout(() => {
       client.deleteMessages(channelEntity, [helpMsg.id, originalMsgId].filter(Boolean), { revoke: true }).catch(() => {});
@@ -558,15 +573,29 @@ async function handleSongCommand(client, channelEntity, commandText, originalMsg
       fromPeer: botPeer,
     });
 
-    if (onTrackForwarded && forwarded && forwarded[0]) {
+    let channelMsg = (forwarded && forwarded[0] && forwarded[0].id) ? forwarded[0] : null;
+    if (!channelMsg) {
+      // GramJS returns [undefined] for channel forwards — fetch the newly forwarded message from channel
+      const recent = await client.getMessages(channelEntity, { limit: 1 });
+      if (recent && recent[0] && recent[0].media?.document) {
+        channelMsg = recent[0];
+      }
+    }
+
+    let forwardResult = null;
+    if (onTrackForwarded && channelMsg) {
       try {
-        await onTrackForwarded(forwarded[0]);
+        forwardResult = await onTrackForwarded(channelMsg);
       } catch (idxErr) {
         console.warn('[Downloader] Post-forward indexing error:', idxErr.message);
       }
     }
 
-    await updateStatus(`✅ **Added to Music Library!**`);
+    if (forwardResult && forwardResult.discarded) {
+      await updateStatus(`ℹ️ **Already in your library!** (Duplicate removed)`);
+    } else {
+      await updateStatus(`✅ **Added to Music Library!**`);
+    }
 
     setTimeout(async () => {
       try {
