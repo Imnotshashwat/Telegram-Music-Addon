@@ -121,4 +121,4 @@ If hosting on a free provider that sleeps after inactivity (like Render's free t
 
 ## License
 
-MIT
+This project is licensed under the [MIT License](LICENSE).
