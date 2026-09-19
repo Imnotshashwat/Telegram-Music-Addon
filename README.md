@@ -1,17 +1,19 @@
 # Telegram Music Addon
 
-Self-hosted [BitChord](https://github.com/kushagrasinghx/BitChord) addon for streaming personal FLAC and hi-res audio from Telegram using GramJS and Express. Built for personal use.
+Self-hosted [BitChord](https://github.com/kushagrasinghx/BitChord) addon for streaming personal FLAC, Dolby Atmos, and hi-res audio from Telegram using GramJS and Express. Built for personal use.
 
-BitChord searches this server whenever a track is requested. If the track is present in your Telegram channel, BitChord streams the original FLAC/ALAC file directly to ExoPlayer. If not, it falls back to Jio Saavan/YouTube Music.
+BitChord searches this server whenever a track is requested. If the track is present in your Telegram channel, BitChord streams the original FLAC, ALAC, or Dolby Atmos file directly to ExoPlayer. If not, it falls back to Jio Saavan/YouTube Music.
 
 ## Features
 
-- **Free storage & no quotas**: Unlimited FLAC storage with zero daily bandwidth limits or playback throttling.
-- **Direct FLAC streaming**: HTTP 206 range requests pull 64KB–512KB slices on demand for instant ExoPlayer seeking without re-encoding.
+- **Free storage & no quotas**: Unlimited audio storage with zero daily bandwidth limits or playback throttling.
+- **Direct FLAC and Dolby Atmos streaming**: HTTP 206 range requests pull 64KB to 512KB slices on demand for instant ExoPlayer seeking without re-encoding.
+- **Dolby Atmos spatial audio**: Streams immersive E-AC-3 JOC audio in MP4 containers with automatic tag detection and `?atmos=auto` preference support.
 - **Interactive `/s` search**: Search Deezer with `/s <name>` to browse 7 tracks per page, navigate with inline buttons, and download FLACs directly. For full playlists, paste the link in your private chat with `@MusicsHuntersbot`.
 - **In-memory indexing**: Keeps library metadata in RAM for sub-5ms search response.
 - **Title & artist matching**: Normalizes titles and composer duos to match BitChord and YouTube Music queries.
-- **Quality deduplication**: Automatically keeps higher-quality audio files when duplicates appear (exempt files with `/keep`).
+- **ISRC matching**: Direct lookup by recording code for exact track identification.
+- **Quality deduplication**: Automatically keeps higher-quality audio files when duplicates appear while preserving Dolby Atmos mixes alongside stereo lossless copies (exempt files with `/keep`).
 - **User chatter auto-cleaner**: Automatically removes casual chat and spam from regular users while keeping audio files, bot menus, commands, and admin broadcast posts safe.
 
 > [!NOTE]
@@ -54,15 +56,15 @@ The channel listener deletes casual chat, photos, stickers, GIFs, and spam sent 
 
 ## How it works
 
-1. You upload audio files (FLAC, ALAC, WAV, MP3, M4A) to a private Telegram channel.
+1. You upload audio files (FLAC, ALAC, WAV, MP3, M4A, or Dolby Atmos MP4/EAC3) to a private Telegram channel.
 2. The server authenticates with Telegram via MTProto (GramJS) using a user session, bypassing standard bot file size limits.
 3. The server extracts audio metadata (title, artist, album, bit depth, sample rate) and builds a local index.
-4. BitChord queries `/manifest.json`, `/search?q=...`, and `/stream/:id` using its pluggable source protocol.
+4. BitChord queries `/manifest.json`, `/search?q=...`, `/isrc/:code`, and `/stream/:id` using its pluggable source protocol.
 5. BitChord's ExoPlayer streams audio directly through the `/audio/:id` endpoint.
 
 ### Exactly What Happens When You Tap a Song:
 
-1. **Instant Playback (0–300ms):**  
+1. **Instant Playback (0 to 300ms):**  
    BitChord starts playing from **YouTube Music immediately** so you hear audio without any buffering delay.
 2. **Parallel Background Race (Simultaneous):**  
    In the background, BitChord fires queries to **both** your Telegram Addon and JioSaavn at the exact same time.
@@ -73,7 +75,7 @@ The channel listener deletes casual chat, photos, stickers, GIFs, and spam sent 
    * If it's not on JioSaavn either, it stays on **YouTube Music (160 kbps)**.
 
 > [!NOTE]
-> If your cloud host was asleep (cold start) and takes a few seconds to wake up, JioSaavn might upgrade first for a second, then Telegram FLAC will seamlessly take over as soon as the server responds. Keep the server awake with a free pinger (see Step 5 below) to eliminate this delay completely.
+> If your cloud host was asleep (cold start) and takes a few seconds to wake up, JioSaavn might upgrade first for a second, then Telegram FLAC takes over as soon as the server responds. Keep the server awake with a free pinger (see Step 5 below) to eliminate this delay completely.
 
 ## Quick start
 
@@ -130,7 +132,7 @@ Set the following environment variables in your deployment dashboard:
 | `TELEGRAM_CHANNEL` | Channel username (e.g. `@my_vault`) or numeric ID (e.g. `-1001234567890`) |
 | `PORT` | Web server port (defaults to `3000` or assigned by host) |
 | `ENABLE_CHANNEL_NOTIFICATIONS` | *(Optional)* Set to `true` if you want cleanup summary notifications posted to your channel (default: `false` / 100% silent) |
-| `TELEGRAM_BOT_TOKEN` | *(Optional)* Bot token from @BotFather to enable real square UI buttons `[ 1️⃣ ] [ 2️⃣ ] [ 3️⃣ ] [ 4️⃣ ] [ 5️⃣ ]` under `/s` results. If not set, the addon renders direct clickable `/1`–`/5` command links with zero setup required. |
+| `TELEGRAM_BOT_TOKEN` | *(Optional)* Bot token from @BotFather to enable real square UI buttons `[ 1️⃣ ] [ 2️⃣ ] [ 3️⃣ ] [ 4️⃣ ] [ 5️⃣ ]` under `/s` results. If not set, the addon renders direct clickable `/1` to `/5` command links with zero setup required. |
 
 ### 5. Keeping It Running 24/7 (Preventing Cold Starts)
 
@@ -153,10 +155,13 @@ If hosting on a free provider that sleeps after inactivity (like Render's free t
 ## API Endpoints
 
 - `GET /manifest.json`: Addon metadata and supported capabilities.
-- `GET /search?q=:query`: Sub-5ms in-memory search across indexed tracks.
-- `GET /stream/:id`: Stream metadata and direct audio playback URL.
+- `GET /search?q=:query&atmos=auto`: Sub-5ms in-memory search across indexed tracks with optional Dolby Atmos prioritization.
+- `GET /isrc/:code`: Exact track match by ISRC recording code (BitChord).
+- `GET /resolve-isrc?isrc=:code`: Exact track match by ISRC recording code (Eclipse Music).
+- `GET /stream/:id`: Stream metadata (FLAC or E-AC-3 JOC MP4) and direct audio playback URL.
 - `GET /audio/:id`: HTTP 206 range-enabled audio streaming.
 - `GET /artwork/:id`: Embedded album artwork images.
+- `GET /icon.png`: Lossless addon badge served for BitChord source lists.
 - `GET /notifications/status`: Check deduplication status and active notification mode (`silent` or `active`).
 - `GET /notifications/flush`: Manually trigger library cleanup digest flush.
 - `GET /debug/requests`: Live log buffer of the last 50 incoming requests.

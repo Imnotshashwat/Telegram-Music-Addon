@@ -1,6 +1,3 @@
-// Interactive login helper for Telegram MTProto
-// Generates your TELEGRAM_SESSION_STRING and optionally saves it directly into .env
-
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
@@ -42,7 +39,7 @@ function saveEnvKey(key, value) {
 
 (async () => {
   console.log('=================================================================');
-  console.log('       BitChord Telegram Music Addon — Login Setup               ');
+  console.log('       BitChord Telegram Music Addon - Login Setup               ');
   console.log('=================================================================\n');
 
   let apiIdStr = process.env.TELEGRAM_API_ID;

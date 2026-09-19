@@ -59,7 +59,7 @@ if (!API_ID || !API_HASH || !SESSION_STRING || !CHANNEL) {
   process.exit(1);
 }
 
-const AUDIO_EXTENSIONS = ['flac', 'mp3', 'm4a', 'aac', 'wav', 'ogg', 'opus', 'alac'];
+const AUDIO_EXTENSIONS = ['flac', 'mp3', 'm4a', 'aac', 'wav', 'ogg', 'opus', 'alac', 'mp4', 'ec3', 'eac3'];
 const EXT_TO_FORMAT = {
   flac: 'flac',
   mp3: 'mp3',
@@ -69,7 +69,12 @@ const EXT_TO_FORMAT = {
   ogg: 'ogg',
   opus: 'opus',
   alac: 'alac',
+  mp4: 'mp4',
+  ec3: 'eac3',
+  eac3: 'eac3',
 };
+
+const ATMOS_REGEX = /\b(atmos|dolby\s*atmos|eac3[-\s]?joc|eac3|ec3|e-ac-3|spatial\s*audio)\b|\[atmos\]|\(atmos\)/i;
 
 function isAudioDocument(doc) {
   if (!doc) return false;
@@ -85,7 +90,7 @@ function isAudioDocument(doc) {
   return Boolean(isAudioMime || isAudioExt || isAudioAttr);
 }
 
-// Known composer duos that are hyphenated in FLAC tags but separated with & or comma on YouTube Music / BitChord
+// Known composer duos that are hyphenated in tags but separated on streaming services
 const COMPOSER_DUOS = [
   [/vishal[-\s–—]+shekhar/gi, 'Vishal & Shekhar'],
   [/sachin[-\s–—]+jigar/gi, 'Sachin & Jigar'],
@@ -108,7 +113,6 @@ function formatArtistForClient(artistStr) {
   for (const [pattern, replacement] of COMPOSER_DUOS) {
     formatted = formatted.replace(pattern, replacement);
   }
-  // Also normalize generic " - " (space-dash-space) used to separate multiple artists in tags
   formatted = formatted.replace(/\s+[-–—]+\s+/g, ', ');
   return formatted.trim();
 }
@@ -121,23 +125,16 @@ let channelEntity = null;
 let trackIndex = [];
 let lastIndexed = 0;
 
-// In-memory media cache: maps track ID string -> Telegram msg.media object
-// Eliminates the redundant 1-2 second client.getMessages() round-trip on every seek
 const mediaCache = new Map();
-
-// Fast-Start buffer cache: maps track ID -> first 512KB of audio bytes (served from RAM for instant ExoPlayer start)
-// 15 tracks × 512KB ≈ 7.6MB RAM – well within Render's 512MB free tier limit.
 const fastStartCache = new Map();
-const FAST_START_BYTES = 512 * 1024; // 512 KB – covers ~3-4 seconds of lossless FLAC audio
+const FAST_START_BYTES = 512 * 1024;
 
-// In-memory request log ring buffer (keeps last 50 requests for production debugging)
 const recentRequests = [];
 function recordRequest(entry) {
   recentRequests.unshift(entry);
   if (recentRequests.length > 50) recentRequests.pop();
 }
 
-// Helper: load cached tracks from disk
 function loadCache() {
   try {
     if (fs.existsSync(CACHE_FILE)) {
@@ -145,8 +142,14 @@ function loadCache() {
       trackIndex = JSON.parse(data);
       for (const t of trackIndex) {
         if (t.artist) t.artist = formatArtistForClient(t.artist);
+        if (t.format === 'eac3-joc' || t.quality === 'Dolby Atmos' || ATMOS_REGEX.test(t.title || '') || ATMOS_REGEX.test(t.fileName || '')) {
+          t.isAtmos = true;
+          t.format = 'eac3-joc';
+          t.audioModes = ['DOLBY_ATMOS'];
+          t.audioMode = 'DOLBY_ATMOS';
+        }
       }
-      console.log(`Loaded ${trackIndex.length} track(s) from local cache (${CACHE_FILE}).`);
+      console.log(`Loaded ${trackIndex.length} track(s) from cache.`);
     }
   } catch (err) {
     console.warn(`Could not load cache: ${err.message}`);
@@ -202,8 +205,6 @@ function getBaseUrl(req) {
   return `${proto}://${host}`;
 }
 
-// Fetch a small chunk (128KB) of audio file to parse deep metadata (sample rate, bit depth, tags)
-// without downloading the entire 50MB+ FLAC file.
 async function getHeaderChunk(media, maxBytes = 128 * 1024) {
   const chunks = [];
   let downloaded = 0;
@@ -223,17 +224,13 @@ async function getHeaderChunk(media, maxBytes = 128 * 1024) {
       }
     }
     return Buffer.concat(chunks).slice(0, maxBytes);
-  } catch (err) {
+  } catch (_) {
     return null;
   }
 }
 
-// Pre-warm the fast-start buffer for a single track:
-// Downloads the first FAST_START_BYTES of audio from Telegram and stores it in RAM.
-// This lets ExoPlayer start playing within 0.3s (served from RAM) while the rest
-// of the FLAC streams live from Telegram in the background.
 async function prewarmFastStart(trackId, media) {
-  if (fastStartCache.has(trackId)) return; // Already cached
+  if (fastStartCache.has(trackId)) return;
   const chunks = [];
   let downloaded = 0;
   try {
@@ -257,12 +254,10 @@ async function prewarmFastStart(trackId, media) {
       console.log(`[FastStart] Pre-warmed ${buf.length} bytes for track ${trackId}`);
     }
   } catch (err) {
-    // Non-fatal: if pre-warm fails, streaming falls back to live MTProto normally
     console.warn(`[FastStart] Pre-warm failed for track ${trackId}: ${err.message}`);
   }
 }
 
-// Pre-warm all currently indexed tracks in the background (one at a time to avoid flooding MTProto)
 async function prewarmAllTracks() {
   console.log(`[FastStart] Starting pre-warm for ${trackIndex.length} track(s)...`);
   for (const track of trackIndex) {
@@ -270,16 +265,14 @@ async function prewarmAllTracks() {
     const media = mediaCache.get(track.id);
     if (!media) continue;
     await prewarmFastStart(track.id, media);
-    // Small gap between downloads to avoid rate-limiting Telegram MTProto
     await new Promise((r) => setTimeout(r, 500));
   }
-  console.log(`[FastStart] Pre-warm complete! ${fastStartCache.size}/${trackIndex.length} track(s) cached in RAM.`);
+  console.log(`[FastStart] Pre-warm complete: ${fastStartCache.size}/${trackIndex.length} track(s) cached.`);
 }
 
 async function parseTrackMessage(msg) {
   if (!msg.media || !msg.media.document) return null;
 
-  // Cache media object in memory
   mediaCache.set(String(msg.id), msg.media);
 
   const doc = msg.media.document;
@@ -287,7 +280,6 @@ async function parseTrackMessage(msg) {
   const ext = extFromName(fileName);
   const audioAttr = getAudioAttr(msg);
 
-  // If extension is known audio OR document has audio attribute
   const isAudio = AUDIO_EXTENSIONS.includes(ext) || Boolean(audioAttr);
   if (!isAudio) return null;
 
@@ -296,7 +288,6 @@ async function parseTrackMessage(msg) {
   const sizeBytes = Number(doc.size) || 0;
   const hasArtwork = Boolean(doc.thumbs && doc.thumbs.length > 0);
 
-  // Initial metadata from Telegram's instant attributes (zero network bytes!)
   let title = (audioAttr && audioAttr.title) ? audioAttr.title.trim() : fallbackTitle;
   let artist = (audioAttr && audioAttr.performer) ? audioAttr.performer.trim() : 'Unknown Artist';
   let duration = (audioAttr && audioAttr.duration) ? Math.round(audioAttr.duration) : undefined;
@@ -305,7 +296,6 @@ async function parseTrackMessage(msg) {
   let bitDepth = undefined;
   let isrc = undefined;
 
-  // Inspect the first 128KB only if title or performer are missing from Telegram audio attributes
   const shouldSniffTags = (!audioAttr || !audioAttr.title || !audioAttr.performer) && sizeBytes > 0;
   let parsedCodec = null;
   if (shouldSniffTags) {
@@ -333,27 +323,37 @@ async function parseTrackMessage(msg) {
           if (!duration && parsed.format.duration) duration = Math.round(parsed.format.duration);
         }
       }
-    } catch (e) {
-      // Non-fatal, keep attributes extracted from Telegram
-    }
+    } catch (_) {}
   }
 
-  // Quality badge text & format resolution
+  const msgText = (msg.message || msg.text || '');
+  const isAtmos = Boolean(
+    ATMOS_REGEX.test(fileName) ||
+    ATMOS_REGEX.test(msgText) ||
+    ATMOS_REGEX.test(title) ||
+    (parsedCodec && ATMOS_REGEX.test(parsedCodec)) ||
+    ext === 'ec3' ||
+    ext === 'eac3'
+  );
+
   let formatName = EXT_TO_FORMAT[resolvedExt] || resolvedExt;
   let rawKbps = 0;
   if (sizeBytes && duration) {
     rawKbps = Math.round((sizeBytes * 8) / (duration * 1000));
   }
 
-  // Detect ALAC in .m4a containers (Apple Music delivers ALAC in .m4a)
-  if (formatName === 'm4a' && (parsedCodec === 'ALAC' || rawKbps > 500)) {
+  if (isAtmos) {
+    formatName = 'eac3-joc';
+  } else if (formatName === 'm4a' && (parsedCodec === 'ALAC' || rawKbps > 500)) {
     formatName = 'alac';
     if (!bitDepth) bitDepth = rawKbps > 2000 ? 24 : 16;
     if (!sampleRate) sampleRate = 48000;
   }
 
   let qualityText = formatName.toUpperCase();
-  if (bitDepth && sampleRate) {
+  if (isAtmos) {
+    qualityText = 'Dolby Atmos';
+  } else if (bitDepth && sampleRate) {
     qualityText = `${bitDepth}-bit / ${(sampleRate / 1000).toFixed(1)}kHz ${formatName.toUpperCase()}`;
   } else if (['flac', 'wav', 'alac'].includes(formatName)) {
     qualityText = `16-bit / 44.1kHz ${formatName.toUpperCase()} Lossless`;
@@ -361,8 +361,7 @@ async function parseTrackMessage(msg) {
     qualityText = `${formatName.toUpperCase()} (${Math.min(rawKbps || 320, 320)}kbps)`;
   }
 
-  const msgText = (msg.message || msg.text || '').toLowerCase();
-  const keep = msgText.includes('/keep') || msgText.includes('/ig') || msgText.includes('#keep');
+  const keep = msgText.toLowerCase().includes('/keep') || msgText.toLowerCase().includes('/ig') || msgText.toLowerCase().includes('#keep');
 
   return {
     id: String(msg.id),
@@ -377,37 +376,31 @@ async function parseTrackMessage(msg) {
     isrc,
     hasArtwork,
     sizeBytes,
-    mimeType: doc.mimeType || 'audio/mpeg',
+    mimeType: isAtmos ? 'audio/mp4' : (doc.mimeType || 'audio/mpeg'),
+    isAtmos: isAtmos || undefined,
+    audioModes: isAtmos ? ['DOLBY_ATMOS'] : undefined,
+    audioMode: isAtmos ? 'DOLBY_ATMOS' : undefined,
     keep: keep ? true : undefined,
   };
 }
 
-// ── Smart Audio Quality Deduplication & Channel Notifications ──────────────
-
 function getQualityScore(track) {
+  if (track.isAtmos) {
+    return 9000000 + (track.sizeBytes || 0);
+  }
+
   const fmt = (track.format || '').toLowerCase();
-  const isLossless = ['flac', 'wav', 'alac'].includes(fmt);
-  if (isLossless) {
+  if (['flac', 'wav', 'alac'].includes(fmt)) {
     const bits = track.bitDepth || 16;
     const rate = track.sampleRate || 44100;
-    // Lossless base score is 1,000,000 + (bitDepth * sampleRate)
-    // 24-bit / 192kHz = 5,608,000
-    // 24-bit / 96kHz  = 3,304,000
-    // 24-bit / 48kHz  = 2,152,000
-    // 24-bit / 44.1kHz = 2,058,400
-    // 16-bit / 44.1kHz = 1,705,600
     return 1000000 + (bits * rate);
   }
 
-  // Lossy formats (opus, aac, m4a, mp3, ogg)
   let rawKbps = 320;
   if (track.sizeBytes && track.duration) {
     rawKbps = Math.round((track.sizeBytes * 8) / (track.duration * 1000));
   }
 
-  // Codec efficiency multiplier for fair quality comparison:
-  // Opus is modern and outperforms MP3 at lower bitrates (160kbps Opus ~ 320kbps MP3)
-  // AAC / M4A has higher coding efficiency than MP3 (256kbps AAC ~ 320kbps MP3)
   let multiplier = 1.0;
   if (fmt === 'opus') multiplier = 1.5;
   else if (fmt === 'aac' || fmt === 'm4a') multiplier = 1.25;
@@ -423,6 +416,9 @@ function formatBytes(bytes) {
 }
 
 function describeTrackQuality(track) {
+  if (track.isAtmos) {
+    return 'Dolby Atmos';
+  }
   const fmt = (track.format || 'mp3').toUpperCase();
   if (track.bitDepth && track.sampleRate) {
     return `${track.bitDepth}-bit / ${(track.sampleRate / 1000).toFixed(1)}kHz ${fmt}`;
@@ -441,9 +437,9 @@ function normalizeTitle(t) {
   if (!t) return '';
   return t
     .toLowerCase()
-    .replace(/\((?:from|official|audio|video|lyrics|full song|remastered|hd|hq|club mix|feat\.?|ft\.?|radio edit|clean|explicit).*?\)/gi, '')
-    .replace(/\[(?:from|official|audio|video|lyrics|full song|remastered|hd|hq|club mix|feat\.?|ft\.?|radio edit|clean|explicit).*?\]/gi, '')
-    .replace(/\s*[-–—]\s*(?:radio edit|original mix|single|clean|explicit|from\s+.*?)$/gi, '')
+    .replace(/\((?:from|official|audio|video|lyrics|full song|remastered|hd|hq|club mix|feat\.?|ft\.?|radio edit|clean|explicit|atmos|dolby\s*atmos).*?\)/gi, '')
+    .replace(/\[(?:from|official|audio|video|lyrics|full song|remastered|hd|hq|club mix|feat\.?|ft\.?|radio edit|clean|explicit|atmos|dolby\s*atmos).*?\]/gi, '')
+    .replace(/\s*[-–—]\s*(?:radio edit|original mix|single|clean|explicit|atmos|dolby\s*atmos|from\s+.*?)$/gi, '')
     .replace(/[^\w\s]/gi, '')
     .replace(/\s+/g, ' ')
     .trim();
@@ -451,7 +447,6 @@ function normalizeTitle(t) {
 
 function getCoreTitle(str) {
   if (!str) return '';
-  // If title has "Artist - SongName", take the right side
   if (str.includes(' - ') || str.includes(' – ') || str.includes(' — ')) {
     const parts = str.split(/\s+[-–—]+\s+/);
     return normalizeTitle(parts[parts.length - 1]);
@@ -471,7 +466,11 @@ function normalizeArtist(a) {
 function isDuplicate(a, b) {
   if (a.id === b.id) return false;
 
-  // Duration safeguard: if both tracks have known duration, allow up to 15s tolerance
+  // Preserve both Dolby Atmos and stereo mixes
+  if (Boolean(a.isAtmos) !== Boolean(b.isAtmos)) {
+    return false;
+  }
+
   if (a.duration && b.duration && Math.abs(a.duration - b.duration) > 15) {
     return false;
   }
@@ -493,7 +492,6 @@ function isDuplicate(a, b) {
       const hasCommonArtist = wordsA.some((w) => artistB.includes(w)) || wordsB.some((w) => artistA.includes(w));
       if (hasCommonArtist) return true;
 
-      // When core title matches and duration is close (<= 6s), it's the same song
       if (a.duration && b.duration && Math.abs(a.duration - b.duration) <= 6) {
         return true;
       }
@@ -505,9 +503,6 @@ function isDuplicate(a, b) {
   return false;
 }
 
-// ── Silent Deduplication & Optional Notifications ───────────────────────────
-// By default, duplicate cleanup and quality upgrades are 100% silent (no spam in channel).
-// Set ENABLE_CHANNEL_NOTIFICATIONS=true in .env / Render if you want digest messages posted.
 const ENABLE_CHANNEL_NOTIFICATIONS = process.env.ENABLE_CHANNEL_NOTIFICATIONS === 'true';
 
 const NOTIF_STATE_FILE = path.join(__dirname, 'notification_state.json');
@@ -932,14 +927,27 @@ function findTrack(id) {
 
 // ── BitChord / Stremio Addon Endpoints ─────────────────────────────────────
 
+// Addon Icon: BitChord fetches this badge to display in the Sources settings list
+app.get('/icon.png', (req, res) => {
+  const iconPath = path.resolve(__dirname, 'icon.png');
+  if (fs.existsSync(iconPath)) {
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    return res.sendFile(iconPath);
+  }
+  res.status(404).send('Icon not found');
+});
+
 // Manifest: BitChord queries this to verify addon id, name, and capabilities
 app.get('/manifest.json', (req, res) => {
+  const base = getBaseUrl(req);
   res.json({
     id: 'com.personal.telegrammusic',
     name: 'Telegram Music',
-    version: `1.9.1 • ${trackIndex.length} songs`,
+    version: `2.0.0 • ${trackIndex.length} songs`,
     description: 'Personal hi-res, lossless, and high-quality music library streamed directly from Telegram',
-    resources: ['search', 'stream'],
+    icon: `${base}/icon.png`,
+    resources: ['search', 'stream', 'isrc'],
     types: ['track'],
     contentType: 'music',
   });
@@ -997,7 +1005,7 @@ app.get('/notifications/flush', async (req, res) => {
 
 const ARTIST_SEPARATORS_REGEX = /\s*(?:[,&/;·|]|\band\b|\bx\b|\bvs\.?\b|\bfeat\.?\b|\bft\.?\b|\bfeaturing\b|\bwith\b)\s*/i;
 const BRACKETED_REGEX = /[([][^()[\]]*[)\]]/g;
-const NOISE_WORDS_REGEX = /\b(?:official|video|audio|lyrics|lyric|lyrical|song|songs|full|hd|hq|4k|mp3|flac|ost|soundtrack|remaster|remastered)\b/gi;
+const NOISE_WORDS_REGEX = /\b(?:official|video|audio|lyrics|lyric|lyrical|song|songs|full|hd|hq|4k|mp3|flac|ost|soundtrack|remaster|remastered|atmos|dolby)\b/gi;
 
 function extractCoreTitle(title) {
   if (!title) return '';
@@ -1057,37 +1065,29 @@ function scoreTrackMatch(track, query) {
   const trackArtist = (track.artist || '').toLowerCase();
   const trackAlbum = (track.album || '').toLowerCase();
 
-  // Fast direct match
   const fullText = `${track.title} ${track.artist} ${track.album || ''}`.toLowerCase();
   if (fullText.includes(qClean)) return 180;
 
   const queryCore = extractCoreTitle(qClean);
 
-  // 1. Exact Core Title Match
   if (queryCore === trackTitleCore) {
     return 100;
   }
 
-  // 2. Query begins with Track Core Title (e.g. "party on my mind pritam")
   if (queryCore.startsWith(trackTitleCore) || trackTitleCore.startsWith(queryCore)) {
     const extraWords = queryCore.replace(trackTitleCore, '').trim();
     if (!extraWords) {
       return 100;
     }
-    // Check if extra words match any artist using BitChord's sameArtist/runOf
     if (sharesArtist(extraWords, track.artist)) {
-      return 150; // Exact title + verified shared artist = Top Match!
+      return 150;
     }
-    // Check if extra words match album
     if (trackAlbum && trackAlbum.includes(extraWords)) {
       return 120;
     }
-    // Title matched, but extra words are present (e.g. composer, record label, video tags).
-    // Return 85 so BitChord receives the candidate and its client-side TrackMatcher validates duration/artist.
     return 85;
   }
 
-  // 3. Token-based fallback matching
   const queryTokens = qClean.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((w) => w.length > 1);
   const titleTokens = trackTitleCore.split(/\s+/).filter(Boolean);
   const allTrackTokens = new Set([
@@ -1128,25 +1128,51 @@ async function onTrackForwarded(msg) {
   return null;
 }
 
-// Search: BitChord calls /search?q=... to find tracks (100% in-memory for instant < 5ms response!)
+function formatTrackForClient(t, base) {
+  const isAtmos = Boolean(t.isAtmos);
+  return {
+    id: t.id,
+    title: t.title,
+    artist: formatArtistForClient(t.artist),
+    album: t.album || '',
+    duration: t.duration,
+    format: isAtmos ? 'eac3-joc' : t.format,
+    audioQuality: isAtmos ? 'Dolby Atmos' : (t.quality || 'lossless'),
+    audioModes: isAtmos ? ['DOLBY_ATMOS'] : undefined,
+    atmos: isAtmos ? true : undefined,
+    artworkURL: t.hasArtwork ? `${base}/artwork/${t.id}` : undefined,
+    albumArtworkURL: t.hasArtwork ? `${base}/artwork/${t.id}` : undefined,
+    streamURL: `${base}/audio/${t.id}`,
+    isrc: t.isrc,
+  };
+}
+
 app.get('/search', async (req, res) => {
   const startTime = Date.now();
   try {
-    // Refresh index periodically in background (every 30 minutes)
     if (Date.now() - lastIndexed > 30 * 60 * 1000) {
       buildTrackIndex().catch((e) => console.error('Background index error:', e.message));
     }
 
     const q = (req.query.q || '').toLowerCase().trim();
     const base = getBaseUrl(req);
+    const prefersAtmos = req.query.atmos === 'auto' || req.query.atmos === 'true';
 
     let matches = trackIndex;
     if (q) {
       matches = trackIndex
-        .map((t) => ({ track: t, score: scoreTrackMatch(t, q) }))
+        .map((t) => {
+          let score = scoreTrackMatch(t, q);
+          if (score > 0 && prefersAtmos && t.isAtmos) {
+            score += 20;
+          }
+          return { track: t, score };
+        })
         .filter((item) => item.score > 0)
         .sort((a, b) => b.score - a.score)
         .map((item) => item.track);
+    } else if (prefersAtmos) {
+      matches = [...trackIndex].sort((a, b) => (b.isAtmos ? 1 : 0) - (a.isAtmos ? 1 : 0));
     }
 
     const elapsed = Date.now() - startTime;
@@ -1155,25 +1181,14 @@ app.get('/search', async (req, res) => {
       type: 'search',
       query: req.query.q || '',
       tier: req.query.quality || 'NONE',
+      atmos: prefersAtmos,
       resultsCount: matches.length,
       topResult: matches[0] ? `${matches[0].title} - ${matches[0].artist} (${matches[0].duration}s)` : null,
       elapsedMs: elapsed,
     });
 
     res.json({
-      tracks: matches.slice(0, 60).map((t) => ({
-        id: t.id,
-        title: t.title,
-        artist: formatArtistForClient(t.artist),
-        album: t.album || '',
-        duration: t.duration,
-        format: t.format,
-        audioQuality: t.quality || 'lossless',
-        artworkURL: t.hasArtwork ? `${base}/artwork/${t.id}` : undefined,
-        albumArtworkURL: t.hasArtwork ? `${base}/artwork/${t.id}` : undefined,
-        streamURL: `${base}/audio/${t.id}`,
-        isrc: t.isrc,
-      })),
+      tracks: matches.slice(0, 60).map((t) => formatTrackForClient(t, base)),
     });
   } catch (err) {
     console.error('Search error:', err);
@@ -1181,10 +1196,50 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// Stream info: BitChord queries this for stream metadata and direct playback URL
+function handleIsrcLookup(req, res) {
+  const rawCode = req.params.code || req.query.code || req.query.isrc || '';
+  const cleanCode = String(rawCode).replace(/\.json$/i, '').trim().toUpperCase();
+
+  if (!cleanCode) {
+    if (req.path.includes('resolve-isrc')) {
+      return res.status(400).json({ error: 'ISRC code required', trackId: null });
+    }
+    return res.status(400).json({ error: 'ISRC code required', tracks: [] });
+  }
+
+  const base = getBaseUrl(req);
+  const matches = trackIndex.filter(
+    (t) => t.isrc && String(t.isrc).trim().toUpperCase() === cleanCode
+  );
+
+  recordRequest({
+    timestamp: new Date().toISOString(),
+    type: 'isrc',
+    query: cleanCode,
+    resultsCount: matches.length,
+    topResult: matches[0] ? `${matches[0].title} - ${matches[0].artist}` : null,
+  });
+
+  if (req.path.includes('resolve-isrc')) {
+    if (matches.length > 0) {
+      return res.json({ trackId: matches[0].id, id: matches[0].id });
+    }
+    return res.status(404).json({ error: 'Track not found', trackId: null });
+  }
+
+  res.json({
+    tracks: matches.map((t) => formatTrackForClient(t, base)),
+  });
+}
+
+app.get('/isrc/:code', handleIsrcLookup);
+app.get('/isrc', handleIsrcLookup);
+app.get('/resolve-isrc', handleIsrcLookup);
+
 app.get('/stream/:id', (req, res) => {
   const track = findTrack(req.params.id);
   const base = getBaseUrl(req);
+  const isAtmos = Boolean(track?.isAtmos);
 
   recordRequest({
     timestamp: new Date().toISOString(),
@@ -1193,19 +1248,21 @@ app.get('/stream/:id', (req, res) => {
     track: track ? `${track.title} - ${track.artist}` : 'NOT_FOUND',
     quality: track ? track.quality : 'UNKNOWN',
     tier: req.query.quality || 'NONE',
+    atmos: isAtmos,
   });
 
   res.json({
     url: `${base}/audio/${req.params.id}`,
-    format: track ? track.format : 'flac',
-    codec: track ? track.format : 'flac',
-    container: track ? track.format : 'flac',
+    format: isAtmos ? 'eac3-joc' : (track ? track.format : 'flac'),
+    codec: isAtmos ? 'eac3-joc' : (track ? track.format : 'flac'),
+    container: isAtmos ? 'mp4' : (track ? track.format : 'flac'),
     manifest: 'none',
     encrypted: false,
+    audioMode: isAtmos ? 'DOLBY_ATMOS' : undefined,
     sampleRate: track ? track.sampleRate : undefined,
     bitDepth: track ? track.bitDepth : undefined,
-    quality: track ? track.quality : undefined,
-    streamQuality: track ? track.quality : undefined,
+    quality: isAtmos ? 'Dolby Atmos' : (track ? track.quality : undefined),
+    streamQuality: isAtmos ? 'Dolby Atmos' : (track ? track.quality : undefined),
   });
 });
 
@@ -1222,7 +1279,6 @@ app.get('/artwork/:id', async (req, res) => {
     const thumbs = doc.thumbs || [];
     if (!thumbs.length) return res.status(404).send('No artwork thumbnail');
 
-    // 1. Instant response if stripped photo is available (0ms network request)
     const stripped = thumbs.find((t) => t instanceof Api.PhotoStrippedSize);
     if (stripped) {
       const jpg = utils.strippedPhotoToJpg(stripped.bytes);
@@ -1231,7 +1287,6 @@ app.get('/artwork/:id', async (req, res) => {
       return res.send(jpg);
     }
 
-    // 2. Download thumbnail via GramJS
     const thumbBuf = await client.downloadMedia(media, { thumb: 0 });
     if (!thumbBuf || thumbBuf.length === 0) {
       return res.status(404).send('No artwork thumbnail');
@@ -1246,8 +1301,6 @@ app.get('/artwork/:id', async (req, res) => {
   }
 });
 
-// Audio streaming: BitChord streams audio bytes with HTTP 206 Range support,
-// instant seeking via in-memory media caching, backpressure control, and immediate abort on client skip/seek.
 app.get('/audio/:id', async (req, res) => {
   const reqStart = Date.now();
   let isConnectionClosed = false;
@@ -1267,13 +1320,11 @@ app.get('/audio/:id', async (req, res) => {
     const track = findTrack(req.params.id);
     if (!track) return res.status(404).send('Track not found');
 
-    // 0ms lookup from in-memory media cache (avoids Telegram API network call!)
     const media = await getMediaForTrack(req.params.id);
     if (!media) return res.status(404).send('Media not found');
 
     if (isConnectionClosed) return;
 
-    // Bulletproof totalSize: fallback to media.document.size, never allow NaN
     const totalSize = Number(track.sizeBytes) || Number(media.document?.size) || 0;
     if (!totalSize || isNaN(totalSize)) {
       console.error(`Invalid totalSize for track ${req.params.id}`);
@@ -1292,7 +1343,6 @@ app.get('/audio/:id', async (req, res) => {
       const match = range.match(/bytes=(\d*)-(\d*)/);
       if (match) {
         if (match[1] === '' && match[2] !== '') {
-          // Suffix range: bytes=-500 (request last 500 bytes)
           const suffix = parseInt(match[2], 10);
           start = Math.max(0, totalSize - suffix);
           end = totalSize - 1;
@@ -1310,7 +1360,6 @@ app.get('/audio/:id', async (req, res) => {
       return res.status(416).end();
     }
 
-    // Strictly clamp boundaries to valid byte positions
     start = Math.max(0, Math.min(start, totalSize - 1));
     end = Math.max(start, Math.min(end, totalSize - 1));
     const bytesNeeded = end - start + 1;
@@ -1326,7 +1375,7 @@ app.get('/audio/:id', async (req, res) => {
     });
 
     res.status(isRange ? 206 : 200);
-    res.setHeader('Content-Type', track.mimeType || (track.format === 'flac' ? 'audio/flac' : 'application/octet-stream'));
+    res.setHeader('Content-Type', track.isAtmos ? 'audio/mp4' : (track.mimeType || (track.format === 'flac' ? 'audio/flac' : 'application/octet-stream')));
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('Keep-Alive', 'timeout=30, max=100');
@@ -1335,10 +1384,6 @@ app.get('/audio/:id', async (req, res) => {
       res.setHeader('Content-Range', `bytes ${start}-${end}/${totalSize}`);
     }
 
-    // Dynamic MTProto block size:
-    // For small probes (<= 128KB), use 64KB/128KB to respond in sub-100ms without socket congestion.
-    // For normal/large streaming, use 512KB for maximum line-rate throughput.
-    // Must be a multiple of 4096 (MIN_CHUNK_SIZE) between 64KB and 512KB.
     const dynamicBlockSize = Math.min(
       512 * 1024,
       Math.max(64 * 1024, Math.ceil(bytesNeeded / 4096) * 4096)
@@ -1609,7 +1654,7 @@ async function startBotCallbackPoller(botToken) {
         const isSelfChat = message.isPrivate; // e.g. Saved Messages
         const trimmedText = (message.text || message.message || '').trim();
 
-        // 1. Check for /s, /song, #s, #song commands
+        // Handle /s and /song search commands
         if (/^[#/](?:song|s)(?:\s+.*)?$/i.test(trimmedText)) {
           if (isMusicChannel || isSelfChat) {
             console.log(`[Song Command] Detected: "${trimmedText}" (msg ID: ${message.id})`);
@@ -1620,7 +1665,7 @@ async function startBotCallbackPoller(botToken) {
           }
         }
 
-        // 2. Check for interactive picker choice (/1, /2, /8, /15, etc.)
+        // Handle picker selection
         const pickerMatch = trimmedText.match(/^\/(\d+)$/);
         if (pickerMatch && hasActivePicker(channelEntity)) {
           if (isMusicChannel || isSelfChat) {
@@ -1633,7 +1678,7 @@ async function startBotCallbackPoller(botToken) {
           }
         }
 
-        // 3. Check for /next, /prev navigation commands
+        // Handle picker pagination
         if ((trimmedText === '/next' || trimmedText === '/more' || trimmedText === '➡️') && hasActivePicker(channelEntity)) {
           if (isMusicChannel || isSelfChat) {
             client.deleteMessages(channelEntity, [message.id], { revoke: true }).catch(() => {});
@@ -1650,7 +1695,7 @@ async function startBotCallbackPoller(botToken) {
           }
         }
 
-        // 4. Check for /cancel command
+        // Handle picker cancellation
         if (trimmedText === '/cancel' && hasActivePicker(channelEntity)) {
           if (isMusicChannel || isSelfChat) {
             client.deleteMessages(channelEntity, [message.id], { revoke: true }).catch(() => {});
@@ -1659,18 +1704,16 @@ async function startBotCallbackPoller(botToken) {
           }
         }
 
-        // 5. Check for /keep, #keep, /ig, #ig command (can be a reply to an audio message or standalone)
+        // Handle /keep command
         if (/^[#/](?:keep|ig)(?:\s+.*)?$/i.test(trimmedText)) {
           if (isMusicChannel) {
             let targetKey = null;
             const repliedId = message.replyTo?.replyToMsgId || message.replyToMsgId ? String(message.replyTo?.replyToMsgId || message.replyToMsgId) : null;
 
             if (repliedId) {
-              // Check if user replied directly to the audio track
               if (pendingDeletions.has(repliedId)) {
                 targetKey = repliedId;
               } else {
-                // Check if user replied to the notice warning message
                 for (const [trackId, info] of pendingDeletions.entries()) {
                   if (info.noticeMsgId && String(info.noticeMsgId) === repliedId) {
                     targetKey = trackId;
@@ -1680,7 +1723,6 @@ async function startBotCallbackPoller(botToken) {
               }
             }
 
-            // Standalone: if user sent /keep or #keep without replying, pick the latest pending duplicate
             if (!targetKey && pendingDeletions.size > 0) {
               const allKeys = Array.from(pendingDeletions.keys());
               targetKey = allKeys[allKeys.length - 1];
@@ -1703,7 +1745,6 @@ async function startBotCallbackPoller(botToken) {
                 }
               }
             } else {
-              // Delete unrecognized keep command after 4 seconds
               setTimeout(() => {
                 client.deleteMessages(channelEntity, [message.id], { revoke: true }).catch(() => {});
               }, 4000);
@@ -1712,7 +1753,7 @@ async function startBotCallbackPoller(botToken) {
           }
         }
 
-        // 6. Check for incoming audio file upload
+        // Handle incoming audio uploads
         const doc = message.media?.document;
         if (doc && isAudioDocument(doc)) {
           if (!isMusicChannel) return;
@@ -1725,7 +1766,7 @@ async function startBotCallbackPoller(botToken) {
           return;
         }
 
-        // 5. Auto-purge channel cleaner: delete any incoming non-music chatter/spam from users
+        // Remove non-music chatter in channel
         if (isMusicChannel && !message.out && !message.post) {
           const isCommand = trimmedText.startsWith('/');
           const hasButtons = Boolean(message.replyMarkup);

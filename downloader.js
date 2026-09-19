@@ -5,10 +5,6 @@ const REMIX_KEYWORDS = [
   'remix', 'mix', 'dj', 'club', 'house', 'afro', 'lofi', 'flip',
   'slowed', 'reverb', 'sped up', 'instrumental', 'karaoke', 'cover', 'tribute'
 ];
-
-/**
- * Parses search result lines from bot text (e.g. "1. Artist - Title (03:45)" or "**1.** Artist - Title [3:45]")
- */
 function parseBotSearchResults(text) {
   if (!text) return [];
   const lines = text.split('\n');
@@ -55,10 +51,6 @@ function parseBotSearchResults(text) {
   return results;
 }
 
-/**
- * Checks if the bot search results are genuinely relevant to the user query.
- * For multi-word queries (e.g. "brown rang"), at least the top candidate must contain the key words.
- */
 function areCandidatesRelevant(candidates, query) {
   if (!candidates || candidates.length === 0) return false;
   const qTokens = query.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((w) => w.length > 1);
@@ -75,22 +67,14 @@ function escapeMarkdown(text) {
   return text.replace(/([_*`\[])/g, '\\$1');
 }
 
-/**
- * Formats the search menu text matching the reference screenshot:
- * 🎧 **Search Results for:** _"<query>"_ `[Deezer FLAC]`
- *
- * 1. Artist - Title `(mm:ss)`
- * 2. Artist - Title `(mm:ss)`
- * ...
- */
 function formatPickerMenu(query, candidates, engine = 'deezer', page = 1) {
   const engineLabel = 'Deezer FLAC';
   const pageLabel = page > 1 ? ` • Page ${page}` : '';
   const cleanQuery = escapeMarkdown(query);
-  const header = `🎧 **Search Results for:** _"${cleanQuery}"_ · [${engineLabel}${pageLabel}]`;
+  const header = `🎧 **Search Results for:** _"${cleanQuery}"_ \`[${engineLabel}${pageLabel}]\``;
 
   const list = candidates.map((c) => {
-    const dur = c.durationStr ? ` (${c.durationStr})` : '';
+    const dur = c.durationStr ? ` \`(${c.durationStr})\`` : '';
     const artist = c.artist ? `${escapeMarkdown(c.artist)} - ` : '';
     const title = escapeMarkdown(c.title);
     return `${c.optionNum}. ${artist}${title}${dur}`;
@@ -99,11 +83,6 @@ function formatPickerMenu(query, candidates, engine = 'deezer', page = 1) {
   return `${header}\n\n${list}`;
 }
 
-/**
- * Builds the Telegram inline keyboard markup matching @MusicsHuntersbot:
- * Row 1: [ 1 ] [ 2 ] [ 3 ] [ 4 ] [ 5 ] [ 6 ] [ 7 ]
- * Row 2: [ ⬅️ ] [ ❌ ] [ ➡️ ]
- */
 function buildMusicsHuntersKeyboard(candidates, searchMsg = null) {
   const numRow = candidates.map((c) => ({
     text: String(c.optionNum),
@@ -131,10 +110,6 @@ function buildMusicsHuntersKeyboard(candidates, searchMsg = null) {
   return [numRow, navRow];
 }
 
-/**
- * Edits a picker message seamlessly using Telegram Bot API (if bot token configured)
- * or MTProto user client fallback.
- */
 async function editMenuMessage(client, channelEntity, menuMsgId, text, replyMarkup = null, parseMode = null) {
   const BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
   if (BOT_TOKEN) {
@@ -170,9 +145,6 @@ async function editMenuMessage(client, channelEntity, menuMsgId, text, replyMark
   }
 }
 
-/**
- * Sends a search query to @MusicsHuntersbot and awaits the search result message with option buttons.
- */
 async function searchMusicsHunters(client, query, onProgress) {
   const botEntity = await client.getEntity('MusicsHuntersbot');
   if (onProgress) onProgress(`Searching "${query}" on @MusicsHuntersbot...`);
@@ -192,7 +164,6 @@ async function searchMusicsHunters(client, query, onProgress) {
 
   let candidates = parseBotSearchResults(searchMsg.message);
   if (candidates.length === 0) {
-    // Fallback if message format is non-standard but buttons exist
     const rowButtons = (searchMsg.replyMarkup?.rows || []).flatMap(r => r.buttons || []);
     const count = Math.min(rowButtons.length || 10, 10);
     for (let i = 1; i <= count; i++) {
@@ -209,9 +180,6 @@ async function searchMusicsHunters(client, query, onProgress) {
   return { searchMsg, candidates: candidates.slice(0, 10) };
 }
 
-/**
- * Clicks the selected option button on @MusicsHuntersbot and waits for the audio file.
- */
 async function downloadMusicsHuntersDocument(client, searchMsg, optionNum, onProgress) {
   const optText = String(optionNum);
   if (onProgress) onProgress(`Requesting option ${optText} from @MusicsHuntersbot in FLAC...`);
@@ -234,9 +202,6 @@ async function downloadMusicsHuntersDocument(client, searchMsg, optionNum, onPro
   throw new Error('@MusicsHuntersbot timed out waiting for audio file');
 }
 
-/**
- * Downloads FLAC from @MusicsHuntersbot (Deezer, Spotify, Qobuz, Tidal).
- */
 async function downloadFromMusicsHunters(client, queryOrUrl, optionNum = 1, onProgress) {
   const botEntity = await client.getEntity('MusicsHuntersbot');
   const isDirectUrl = /^https?:\/\//i.test(queryOrUrl.trim());
@@ -259,7 +224,6 @@ async function downloadFromMusicsHunters(client, queryOrUrl, optionNum = 1, onPr
     throw new Error('@MusicsHuntersbot timed out waiting for audio from link');
   }
 
-  // Keyword search
   const searchResult = await searchMusicsHunters(client, queryOrUrl, onProgress);
   if (!searchResult || !searchResult.searchMsg) {
     throw new Error('@MusicsHuntersbot did not return search result buttons');
@@ -268,7 +232,6 @@ async function downloadFromMusicsHunters(client, queryOrUrl, optionNum = 1, onPr
   return await downloadMusicsHuntersDocument(client, searchResult.searchMsg, optionNum, onProgress);
 }
 
-// Active search picker sessions map: channelId -> session
 const activePickers = new Map();
 
 function hasActivePicker(channelEntity) {
@@ -488,22 +451,17 @@ async function handleSongCommand(client, channelEntity, commandText, originalMsg
   try {
     let audioDocMsg = null;
 
-    // CASE 1: Direct Spotify / Deezer / Qobuz / Tidal / Apple Music URL
     if (/^(https?:\/\/)?(open\.spotify\.com|deezer\.com|deezer\.page\.link|qobuz\.com|tidal\.com|music\.apple\.com)/i.test(queryArg)) {
       await updateStatus(`📥 **Downloading FLAC** via @MusicsHuntersbot...`);
       audioDocMsg = await downloadFromMusicsHunters(client, queryArg, 1, updateStatus);
-    }
-    // CASE 2: Keyword search with explicit option number (e.g. "/s Kesariya 2")
-    else if (/^(.+?)\s+([1-9]\d?)$/.test(queryArg)) {
+    } else if (/^(.+?)\s+([1-9]\d?)$/.test(queryArg)) {
       const numMatch = queryArg.match(/^(.+?)\s+([1-9]\d?)$/);
       const query = numMatch[1].trim();
       const requestedOption = parseInt(numMatch[2], 10);
 
       await updateStatus(`🔍 Downloading Option ${requestedOption} for **"${query}"** in Lossless FLAC...`);
       audioDocMsg = await downloadFromMusicsHunters(client, query, requestedOption, updateStatus);
-    }
-    // CASE 3: Standard keyword search on Deezer (@MusicsHuntersbot)
-    else {
+    } else {
       let engine = 'deezer';
       let searchResult = null;
       let candidates = [];
@@ -521,7 +479,6 @@ async function handleSongCommand(client, channelEntity, commandText, originalMsg
         throw new Error(`No tracks found for "${queryArg}" on Deezer`);
       }
 
-      // Render interactive selection menu matching reference screenshot
       const menuText = formatPickerMenu(queryArg, candidates, engine, 1);
       const keyboard = buildMusicsHuntersKeyboard(candidates, searchResult?.searchMsg);
       const BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
@@ -557,7 +514,6 @@ async function handleSongCommand(client, channelEntity, commandText, originalMsg
         await client.editMessage(channelEntity, { message: statusMsg.id, text: menuText });
       }
 
-      // Register active picker session with 60-second auto-purge timer
       const timer = setTimeout(async () => {
         try {
           const toDel = [menuMsgId];
@@ -578,14 +534,13 @@ async function handleSongCommand(client, channelEntity, commandText, originalMsg
         timer,
       });
 
-      return; // Awaiting user's choice or navigation
+      return;
     }
 
     if (!audioDocMsg || !audioDocMsg.media?.document) {
       throw new Error('Failed to retrieve audio file from bot');
     }
 
-    // Forward direct download to channel
     await updateStatus(`🚀 Uploading track to Music Library...`);
     const botPeer = audioDocMsg.peerId;
     const forwarded = await client.forwardMessages(channelEntity, {
@@ -595,7 +550,6 @@ async function handleSongCommand(client, channelEntity, commandText, originalMsg
 
     let channelMsg = (forwarded && forwarded[0] && forwarded[0].id) ? forwarded[0] : null;
     if (!channelMsg) {
-      // GramJS returns [undefined] for channel forwards — fetch the newly forwarded message from channel
       const recent = await client.getMessages(channelEntity, { limit: 1 });
       if (recent && recent[0] && recent[0].media?.document) {
         channelMsg = recent[0];
