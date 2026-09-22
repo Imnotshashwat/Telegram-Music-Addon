@@ -1,6 +1,6 @@
 {
   "name": "telegram-music-addon",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "BitChord music provider that streams lossless audio directly from a Telegram channel",
   "main": "index.js",
   "type": "commonjs",

@@ -142,6 +142,30 @@ Set the following environment variables in your deployment dashboard:
 | `PORT` | Web server port (defaults to `3000` or assigned by host) |
 | `ENABLE_CHANNEL_NOTIFICATIONS` | *(Optional)* Set to `true` if you want cleanup summary notifications posted to your channel (default: `false` / 100% silent) |
 | `TELEGRAM_BOT_TOKEN` | *(Optional)* Bot token from @BotFather to enable real square UI buttons `[ 1️⃣ ] [ 2️⃣ ] [ 3️⃣ ] [ 4️⃣ ] [ 5️⃣ ]` under `/s` results. If not set, the addon renders direct clickable `/1` to `/5` command links with zero setup required. |
+| `URL_SECRET` | *(Optional)* Secret token to protect public deployments (for example, `mysecret123` or `myvault`). When set, the addon requires `/:secret/manifest.json`, blocking unauthorized web crawlers and strangers from streaming through your Telegram account. |
+
+#### Protecting your public deployment with URL_SECRET (optional)
+
+When hosting TeleMusic on a public URL (Render, Fly.io, or a Cloudflare tunnel), automated web bots or strangers could find your domain and stream files through your Telegram account. Setting a secret path token locks the server so only your devices can access it.
+
+1. **Setting the secret**:
+   - **Locally**: Add `URL_SECRET=your_secret` to your `.env` file (for example, `URL_SECRET=mysecret123`).
+   - **Render**: Open your Web Service dashboard, go to **Environment Variables**, and add `URL_SECRET` with your chosen secret.
+   - **Fly.io**: Run `fly secrets set URL_SECRET="your_secret"`.
+
+2. **Connecting from BitChord**:
+   Add the source URL with your secret path included:
+   ```text
+   https://<your-domain>/<secret>/manifest.json
+   ```
+   Example:
+   ```text
+   https://<subdomain>.trycloudflare.com/mysecret123/manifest.json
+   ```
+   BitChord automatically saves the prefix and attaches it to every search, stream, and artwork request. Any request sent without the secret receives a `401 Unauthorized` response.
+
+3. **Uptime monitoring stays open**:
+   The `/ping` and `/icon.png` endpoints remain public, allowing UptimeRobot or Cron-Job.org to prevent free-tier sleep without needing your secret token.
 
 ### 5. Keeping It Running 24/7 (Preventing Cold Starts)
 
@@ -163,6 +187,8 @@ If hosting on a free provider that sleeps after inactivity (like Render's free t
 
 ## API Endpoints
 
+When `URL_SECRET` is set, all endpoints except `/ping` and `/icon.png` require the `/:secret` prefix (for example, `/:secret/manifest.json` or `/:secret/search`).
+
 - `GET /manifest.json`: Addon metadata and supported capabilities.
 - `GET /search?q=:query&atmos=auto`: Sub-10ms in-memory search across indexed tracks with optional Dolby Atmos prioritization.
 - `GET /isrc/:code`: Exact track match by ISRC recording code (BitChord).
@@ -170,11 +196,11 @@ If hosting on a free provider that sleeps after inactivity (like Render's free t
 - `GET /stream/:id`: Stream metadata (FLAC or E-AC-3 JOC MP4) and direct audio playback URL.
 - `GET /audio/:id`: HTTP 206 range-enabled audio streaming.
 - `GET /artwork/:id`: Embedded album artwork images.
-- `GET /icon.png`: Lossless addon badge served for BitChord source lists.
+- `GET /icon.png`: Lossless addon badge served for BitChord source lists (always public).
 - `GET /notifications/status`: Check deduplication status and active notification mode (`silent` or `active`).
 - `GET /notifications/flush`: Manually trigger library cleanup digest flush.
 - `GET /debug/requests`: Live log buffer of the last 50 incoming requests.
-- `GET /ping`: Uptime monitor heartbeat.
+- `GET /ping`: Uptime monitor heartbeat (always public).
 
 ## License
 

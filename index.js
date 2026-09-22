@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const pkg = require('./package.json');
 const bigInt = require('big-integer');
 const { TelegramClient, utils } = require('telegram');
 const { StringSession } = require('telegram/sessions');
@@ -38,6 +39,7 @@ const API_HASH = cleanEnv(process.env.TELEGRAM_API_HASH);
 let SESSION_STRING = cleanEnv(process.env.TELEGRAM_SESSION_STRING);
 const CHANNEL = cleanEnv(process.env.TELEGRAM_CHANNEL);
 const PORT = process.env.PORT || 3000;
+const URL_SECRET = cleanEnv(process.env.URL_SECRET || process.env.ACCESS_TOKEN);
 const CACHE_FILE = path.join(__dirname, 'tracks_cache.json');
 
 // GramJS StringSession requires the session string to begin with the version character "1"
@@ -204,7 +206,8 @@ function getAudioAttr(msg) {
 function getBaseUrl(req) {
   const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
   const host = req.headers['x-forwarded-host'] || req.get('host') || `localhost:${PORT}`;
-  return `${proto}://${host}`;
+  const prefix = req.secretPrefix ? `/${req.secretPrefix}` : '';
+  return `${proto}://${host}${prefix}`;
 }
 
 async function getHeaderChunk(media, maxBytes = 128 * 1024) {
@@ -931,9 +934,6 @@ async function buildTrackIndex() {
       }
 
       batchCount++;
-      if (batchCount % 100 === 0) {
-        trackIndex = [...newIndex];
-      }
     }
 
     trackIndex = newIndex;
@@ -950,6 +950,52 @@ async function buildTrackIndex() {
 
 function findTrack(id) {
   return trackIndex.find((t) => t.id === id);
+}
+
+// ── Optional Secret URL Path Protection ────────────────────────────────────
+if (URL_SECRET) {
+  app.use((req, res, next) => {
+    // Exempt uptime health monitoring and addon icon
+    if (req.path === '/ping' || req.path === '/icon.png') {
+      return next();
+    }
+
+    const prefix = `/${URL_SECRET}`;
+    const encodedPrefix = `/${encodeURIComponent(URL_SECRET)}`;
+    const matchedPrefix =
+      req.url === prefix || req.url.startsWith(`${prefix}/`) || req.url.startsWith(`${prefix}?`)
+        ? prefix
+        : req.url === encodedPrefix || req.url.startsWith(`${encodedPrefix}/`) || req.url.startsWith(`${encodedPrefix}?`)
+        ? encodedPrefix
+        : null;
+
+    if (matchedPrefix) {
+      req.secretPrefix = URL_SECRET;
+      let newUrl = req.url.slice(matchedPrefix.length);
+      if (!newUrl.startsWith('/')) {
+        newUrl = '/' + newUrl;
+      }
+      req.url = newUrl;
+      req._parsedUrl = undefined;
+      return next();
+    }
+
+    // Also support secret via query param or authorization header
+    if (
+      req.query.secret === URL_SECRET ||
+      req.headers['x-secret-token'] === URL_SECRET ||
+      req.headers.authorization === `Bearer ${URL_SECRET}`
+    ) {
+      req.secretPrefix = URL_SECRET;
+      return next();
+    }
+
+    console.warn(`[Security] Blocked unauthorized request to ${req.originalUrl || req.url} from ${req.ip}`);
+    return res.status(401).json({
+      error: 'Unauthorized: invalid or missing secret path',
+      message: 'This Telegram Music instance requires a valid secret URL prefix (e.g. /:secret/manifest.json)',
+    });
+  });
 }
 
 // ── BitChord / Stremio Addon Endpoints ─────────────────────────────────────
@@ -971,7 +1017,7 @@ app.get('/manifest.json', (req, res) => {
   res.json({
     id: 'com.personal.telegrammusic',
     name: 'Telegram Music',
-    version: `2.0.0 • ${trackIndex.length} songs`,
+    version: `${pkg.version} • ${trackIndex.length} songs`,
     description: 'Personal hi-res, lossless, and high-quality music library streamed directly from Telegram',
     icon: `${base}/icon.png`,
     resources: ['search', 'stream', 'isrc'],
@@ -1558,7 +1604,7 @@ app.get('/debug/faststart', (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    version: '1.9.1',
+    version: pkg.version,
     app: 'BitChord Telegram Music Addon',
     tracksCount: trackIndex.length,
     manifest: `${getBaseUrl(req)}/manifest.json`,
@@ -1846,7 +1892,12 @@ async function startBotCallbackPoller(botToken) {
 
     app.listen(PORT, '0.0.0.0', async () => {
       console.log(`BitChord Addon server running on http://0.0.0.0:${PORT}`);
-      console.log(`Manifest URL: http://localhost:${PORT}/manifest.json`);
+      if (URL_SECRET) {
+        console.log(`Manifest URL (Secret Protected): http://localhost:${PORT}/${URL_SECRET}/manifest.json`);
+        console.log(`[Security] URL_SECRET protection active — unauthorized public requests will be blocked.`);
+      } else {
+        console.log(`Manifest URL: http://localhost:${PORT}/manifest.json`);
+      }
       try {
         await buildTrackIndex();
         checkDigestSchedule();
