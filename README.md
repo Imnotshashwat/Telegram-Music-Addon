@@ -10,7 +10,7 @@ BitChord searches this server whenever a track is requested. If the track is pre
 - **Direct FLAC and Dolby Atmos streaming**: HTTP 206 range requests pull 64KB to 512KB slices on demand for instant ExoPlayer seeking without re-encoding.
 - **Dolby Atmos spatial audio**: Streams immersive E-AC-3 JOC audio in MP4 containers with automatic tag detection and `?atmos=auto` preference support.
 - **Interactive `/s` search**: Search Deezer with `/s <name>` to browse 7 tracks per page, navigate with inline buttons, and download FLACs directly. For full playlists, paste the link in your private chat with `@MusicsHuntersbot`.
-- **In-memory indexing**: Keeps library metadata in RAM for sub-5ms search response.
+- **In-memory indexing**: Keeps library metadata in RAM for sub-10ms search response.
 - **Title & artist matching**: Normalizes titles and composer duos to match BitChord and YouTube Music queries.
 - **ISRC matching**: Direct lookup by recording code for exact track identification.
 - **Quality deduplication**: Automatically keeps higher-quality audio files when duplicates appear while preserving Dolby Atmos mixes alongside stereo lossless copies (exempt files with `/keep`).
@@ -118,6 +118,15 @@ Default local port is `3000`. Test the manifest in a browser:
 http://localhost:3000/manifest.json
 ```
 
+#### Listening on your phone from a local PC (Cloudflare Tunnel)
+Android blocks unencrypted `http://` across local network connections. If you run the addon on your PC and want to stream to the BitChord app on your phone, generate a free HTTPS link without opening any router ports:
+
+```bash
+cloudflared tunnel --url http://localhost:3000
+```
+
+Copy the generated `https://<subdomain>.trycloudflare.com` URL and add it to BitChord.
+
 ### 4. Deploy to the cloud
 
 Because Android ExoPlayer blocks non-HTTPS streams by default, deploy the server to a host with an HTTPS URL (such as Render, Fly.io, or through a Cloudflare tunnel).
@@ -143,7 +152,7 @@ If hosting on a free provider that sleeps after inactivity (like Render's free t
   https://<your-service-name>.onrender.com/ping
   ```
 * Set the interval to **every 10 minutes**.
-* This keeps the server constantly awake, eliminating sleep latency and ensuring sub-5ms search responses so Telegram FLAC always wins the upgrade race instantly.
+* This keeps the server constantly awake, eliminating sleep latency and ensuring sub-10ms search responses so Telegram FLAC always wins the upgrade race instantly.
 
 ### 6. Add to BitChord
 
@@ -155,7 +164,7 @@ If hosting on a free provider that sleeps after inactivity (like Render's free t
 ## API Endpoints
 
 - `GET /manifest.json`: Addon metadata and supported capabilities.
-- `GET /search?q=:query&atmos=auto`: Sub-5ms in-memory search across indexed tracks with optional Dolby Atmos prioritization.
+- `GET /search?q=:query&atmos=auto`: Sub-10ms in-memory search across indexed tracks with optional Dolby Atmos prioritization.
 - `GET /isrc/:code`: Exact track match by ISRC recording code (BitChord).
 - `GET /resolve-isrc?isrc=:code`: Exact track match by ISRC recording code (Eclipse Music).
 - `GET /stream/:id`: Stream metadata (FLAC or E-AC-3 JOC MP4) and direct audio playback URL.

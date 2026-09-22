@@ -119,7 +119,9 @@ function formatArtistForClient(artistStr) {
 
 const client = new TelegramClient(new StringSession(SESSION_STRING), API_ID, API_HASH, {
   connectionRetries: 5,
+  autoReconnect: true,
 });
+client.setLogLevel('error');
 
 let channelEntity = null;
 let trackIndex = [];
@@ -296,7 +298,7 @@ async function parseTrackMessage(msg) {
   let bitDepth = undefined;
   let isrc = undefined;
 
-  const shouldSniffTags = (!audioAttr || !audioAttr.title || !audioAttr.performer) && sizeBytes > 0;
+  const shouldSniffTags = (!audioAttr || !audioAttr.title || !audioAttr.performer || !isrc) && sizeBytes > 0;
   let parsedCodec = null;
   if (shouldSniffTags) {
     try {
@@ -314,7 +316,7 @@ async function parseTrackMessage(msg) {
             artist = parsed.common.artist;
           }
           if (parsed.common.album) album = parsed.common.album;
-          if (parsed.common.isrc && parsed.common.isrc.length > 0) isrc = parsed.common.isrc[0];
+          if (parsed.common.isrc && parsed.common.isrc.length > 0) isrc = parsed.common.isrc[0].trim().toUpperCase();
         }
         if (parsed.format) {
           parsedCodec = parsed.format.codec;
@@ -718,6 +720,32 @@ async function deleteTelegramMessage(messageId) {
   return deleteTelegramMessages([messageId]);
 }
 
+let uploadBatch = [];
+let uploadBatchTimer = null;
+
+function flushUploadBatch() {
+  if (uploadBatch.length === 0) return;
+  const count = uploadBatch.length;
+  if (count === 1) {
+    const t = uploadBatch[0];
+    console.log(`[Auto-indexed] "${t.title}" by ${t.artist} [${describeTrackQuality(t)}]`);
+  } else {
+    console.log(`\n[Batch Upload] Detected and indexed ${count} tracks:`);
+    for (const t of uploadBatch) {
+      console.log(`  • "${t.title}" - ${t.artist} [${describeTrackQuality(t)}]`);
+    }
+    console.log(`[Batch Complete] All ${count} tracks ready in BitChord.\n`);
+  }
+  uploadBatch = [];
+  uploadBatchTimer = null;
+}
+
+function queueUploadedTrackLog(track) {
+  uploadBatch.push(track);
+  if (uploadBatchTimer) clearTimeout(uploadBatchTimer);
+  uploadBatchTimer = setTimeout(flushUploadBatch, 1500);
+}
+
 async function processTrackUpload(newTrack) {
   // If track is explicitly flagged to keep, index it and skip duplicate deletion
   if (newTrack.keep) {
@@ -731,7 +759,7 @@ async function processTrackUpload(newTrack) {
   if (!existingDup) {
     trackIndex.unshift(newTrack);
     saveCache();
-    console.log(`Auto-indexed new track: "${newTrack.title}" by "${newTrack.artist}" (${describeTrackQuality(newTrack)})`);
+    queueUploadedTrackLog(newTrack);
     return newTrack;
   }
 
@@ -867,30 +895,28 @@ async function deduplicateEntireLibrary() {
   return { checked: sorted.length, duplicatesRemoved: removed.length, removed };
 }
 
+let isIndexing = false;
+
 async function buildTrackIndex() {
-  console.log('Indexing Telegram channel (adaptive full history scan)...');
+  if (isIndexing) return;
+  isIndexing = true;
   try {
     const newIndex = [];
     const seenIds = new Set();
     let batchCount = 0;
 
-    // GramJS iterMessages streams through channel history from newest to oldest.
-    // Specifying limit: 5000 with waitTime: 0 guarantees full fast iteration without GramJS timeout warnings.
     for await (const msg of client.iterMessages(channelEntity, { limit: 5000, waitTime: 0 })) {
       const msgIdStr = String(msg.id);
       if (seenIds.has(msgIdStr)) continue;
       seenIds.add(msgIdStr);
 
-      // Fast check: If message has no document or is not an audio file, skip immediately
       const doc = msg.media?.document;
       if (!doc || !isAudioDocument(doc)) {
         continue;
       }
 
-      // Always cache media object for instant seeking
       mediaCache.set(msgIdStr, msg.media);
 
-      // Check if we already have this message ID cached with full metadata
       const existing = trackIndex.find((t) => t.id === msgIdStr);
       if (existing) {
         if (!existing.sizeBytes && doc.size) {
@@ -905,19 +931,20 @@ async function buildTrackIndex() {
       }
 
       batchCount++;
-      if (batchCount % 50 === 0) {
+      if (batchCount % 100 === 0) {
         trackIndex = [...newIndex];
-        console.log(`[Indexer] Indexed ${newIndex.length} audio tracks... (latest msg ID: ${msgIdStr})`);
       }
     }
 
     trackIndex = newIndex;
     lastIndexed = Date.now();
     saveCache();
-    console.log(`Adaptive indexing complete! Scanned ${batchCount} total messages. ${trackIndex.length} track(s) ready in library.`);
+    console.log(`[Library] Channel indexing complete: ${trackIndex.length} tracks loaded.`);
     await deduplicateEntireLibrary();
   } catch (err) {
-    console.error('Error during adaptive track indexing:', err.message);
+    console.error('Error during track indexing:', err.message);
+  } finally {
+    isIndexing = false;
   }
 }
 
@@ -1058,54 +1085,66 @@ function sharesArtist(queryArtistStr, trackArtistStr) {
   return queryArtists.some((q) => trackArtists.some((t) => sameArtist(q, t)));
 }
 
-function scoreTrackMatch(track, query) {
-  if (!query) return 100;
-  const qClean = query.toLowerCase().trim();
+function scoreTrackMatch(track, qContext) {
+  if (!qContext) return 100;
+  const ctx = typeof qContext === 'string'
+    ? {
+        qClean: qContext.toLowerCase().trim(),
+        queryCore: extractCoreTitle(qContext.toLowerCase().trim()),
+        queryTokens: qContext.toLowerCase().trim().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((w) => w.length > 1),
+        wordRegex: null,
+      }
+    : qContext;
+
+  const { qClean, queryCore, queryTokens, wordRegex } = ctx;
+  if (!qClean) return 100;
+  const trackTitle = (track.title || '').toLowerCase();
   const trackTitleCore = extractCoreTitle(track.title);
   const trackArtist = (track.artist || '').toLowerCase();
   const trackAlbum = (track.album || '').toLowerCase();
 
-  const fullText = `${track.title} ${track.artist} ${track.album || ''}`.toLowerCase();
-  if (fullText.includes(qClean)) return 180;
-
-  const queryCore = extractCoreTitle(qClean);
-
-  if (queryCore === trackTitleCore) {
-    return 100;
+  // Exact core title match (e.g. "ada" matches "Ada (From Garam Masala)")
+  if (queryCore && queryCore === trackTitleCore) {
+    return 300;
   }
 
+  // Query is "title artist" and matches core title + primary artist
   if (queryCore.startsWith(trackTitleCore) || trackTitleCore.startsWith(queryCore)) {
     const extraWords = queryCore.replace(trackTitleCore, '').trim();
-    if (!extraWords) {
-      return 100;
-    }
-    if (sharesArtist(extraWords, track.artist)) {
-      return 150;
-    }
-    if (trackAlbum && trackAlbum.includes(extraWords)) {
-      return 120;
-    }
-    return 85;
+    if (!extraWords) return 250;
+    if (trackArtist.includes(extraWords) || sharesArtist(extraWords, track.artist)) return 280;
+    if (trackAlbum && trackAlbum.includes(extraWords)) return 220;
+    return 180;
   }
 
-  const queryTokens = qClean.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((w) => w.length > 1);
+  // Whole word match in title (e.g. "ada" as an isolated word)
+  if (wordRegex && (wordRegex.test(trackTitleCore) || wordRegex.test(trackTitle))) {
+    return 200;
+  }
+
+  // Token matching without Set allocations
   const titleTokens = trackTitleCore.split(/\s+/).filter(Boolean);
-  const allTrackTokens = new Set([
-    ...titleTokens,
-    ...trackArtist.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean),
-    ...trackAlbum.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean),
-  ]);
-
-  const allTitleMatched = titleTokens.length > 0 && titleTokens.every((tw) => queryTokens.includes(tw));
-  if (allTitleMatched) {
-    const hasArtistToken = queryTokens.some((qw) => !titleTokens.includes(qw) && allTrackTokens.has(qw));
-    return hasArtistToken ? 140 : 90;
+  if (titleTokens.length > 0 && titleTokens.every((tw) => queryTokens.includes(tw))) {
+    const hasArtistToken = queryTokens.some((qw) => !titleTokens.includes(qw) && trackArtist.includes(qw));
+    return hasArtistToken ? 210 : 170;
   }
 
-  const matchCount = queryTokens.filter((t) => allTrackTokens.has(t)).length;
-  const ratio = matchCount / queryTokens.length;
+  let matchCount = 0;
+  for (let i = 0; i < queryTokens.length; i++) {
+    const tok = queryTokens[i];
+    if (trackTitleCore.includes(tok) || trackArtist.includes(tok) || trackAlbum.includes(tok)) {
+      matchCount++;
+    }
+  }
+  const ratio = queryTokens.length > 0 ? matchCount / queryTokens.length : 0;
   if (ratio >= 0.6) {
-    return Math.round(ratio * 80);
+    return Math.round(ratio * 120);
+  }
+
+  // Substring match only if query is long enough (>= 5 chars) to prevent short word poisoning
+  if (qClean.length >= 5) {
+    const fullText = `${trackTitle} ${trackArtist} ${trackAlbum}`;
+    if (fullText.includes(qClean)) return 60;
   }
 
   return 0;
@@ -1150,19 +1189,21 @@ function formatTrackForClient(t, base) {
 app.get('/search', async (req, res) => {
   const startTime = Date.now();
   try {
-    if (Date.now() - lastIndexed > 30 * 60 * 1000) {
-      buildTrackIndex().catch((e) => console.error('Background index error:', e.message));
-    }
-
     const q = (req.query.q || '').toLowerCase().trim();
     const base = getBaseUrl(req);
     const prefersAtmos = req.query.atmos === 'auto' || req.query.atmos === 'true';
 
     let matches = trackIndex;
     if (q) {
+      const queryCore = extractCoreTitle(q);
+      const queryTokens = q.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((w) => w.length > 1);
+      const escapedCore = q.replace(/[^a-z0-9]/g, '');
+      const wordRegex = escapedCore ? new RegExp(`\\b${escapedCore}\\b`, 'i') : null;
+      const qContext = { qClean: q, queryCore, queryTokens, wordRegex };
+
       matches = trackIndex
         .map((t) => {
-          let score = scoreTrackMatch(t, q);
+          let score = scoreTrackMatch(t, qContext);
           if (score > 0 && prefersAtmos && t.isAtmos) {
             score += 20;
           }
@@ -1176,6 +1217,10 @@ app.get('/search', async (req, res) => {
     }
 
     const elapsed = Date.now() - startTime;
+    if (q) {
+      const topStr = matches[0] ? ` -> Top match: "${matches[0].title}" by ${matches[0].artist}` : ' -> No match';
+      console.log(`[Search] "${q}" (${matches.length} found, ${elapsed}ms)${topStr}`);
+    }
     recordRequest({
       timestamp: new Date().toISOString(),
       type: 'search',
@@ -1212,6 +1257,9 @@ function handleIsrcLookup(req, res) {
     (t) => t.isrc && String(t.isrc).trim().toUpperCase() === cleanCode
   );
 
+  const topStr = matches[0] ? ` -> Matched: "${matches[0].title}" by ${matches[0].artist}` : ' -> No match';
+  console.log(`[ISRC] "${cleanCode}" (${matches.length} found)${topStr}`);
+
   recordRequest({
     timestamp: new Date().toISOString(),
     type: 'isrc',
@@ -1240,6 +1288,10 @@ app.get('/stream/:id', (req, res) => {
   const track = findTrack(req.params.id);
   const base = getBaseUrl(req);
   const isAtmos = Boolean(track?.isAtmos);
+
+  if (track) {
+    console.log(`[Playback] "${track.title}" by ${track.artist} [${isAtmos ? 'Dolby Atmos' : (track.quality || track.format)}]`);
+  }
 
   recordRequest({
     timestamp: new Date().toISOString(),
@@ -1364,6 +1416,11 @@ app.get('/audio/:id', async (req, res) => {
     end = Math.max(start, Math.min(end, totalSize - 1));
     const bytesNeeded = end - start + 1;
 
+    if (start === 0 || !isRange) {
+      const sizeMb = (totalSize / (1024 * 1024)).toFixed(1);
+      console.log(`[Streaming] "${track.title}" (${sizeMb} MB) | Starting audio playback`);
+    }
+
     recordRequest({
       timestamp: new Date().toISOString(),
       type: 'audio',
@@ -1384,10 +1441,11 @@ app.get('/audio/:id', async (req, res) => {
       res.setHeader('Content-Range', `bytes ${start}-${end}/${totalSize}`);
     }
 
-    const dynamicBlockSize = Math.min(
-      512 * 1024,
-      Math.max(64 * 1024, Math.ceil(bytesNeeded / 4096) * 4096)
-    );
+    // Telegram MTProto upload.GetFile requires chunk size limits to be powers of 2 (64KB, 128KB, 256KB, 512KB)
+    let dynamicBlockSize = 512 * 1024;
+    if (bytesNeeded <= 64 * 1024) dynamicBlockSize = 64 * 1024;
+    else if (bytesNeeded <= 128 * 1024) dynamicBlockSize = 128 * 1024;
+    else if (bytesNeeded <= 256 * 1024) dynamicBlockSize = 256 * 1024;
 
     // Stream directly from Telegram MTProto from the requested byte offset.
     let bytesSent = 0;
@@ -1758,7 +1816,6 @@ async function startBotCallbackPoller(botToken) {
         if (doc && isAudioDocument(doc)) {
           if (!isMusicChannel) return;
 
-          console.log(`Detected new audio upload in channel (msg ID: ${message.id}), processing track...`);
           const track = await parseTrackMessage(message);
           if (track) {
             await processTrackUpload(track);
