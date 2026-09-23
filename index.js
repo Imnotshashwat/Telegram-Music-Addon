@@ -276,27 +276,38 @@ async function getHeaderChunk(media, maxBytes = 128 * 1024) {
 }
 
 let isLookaheadRunning = false;
+const inFlightPrewarms = new Set();
 
 async function prewarmTrackPreamble(trackId, media, title) {
-  if (fastStartCache.has(trackId)) return;
+  const idStr = String(trackId);
+  const existing = fastStartCache.get(idStr);
+  if (existing && existing.length >= FAST_START_BYTES) return;
+  if (inFlightPrewarms.has(idStr)) return;
+  inFlightPrewarms.add(idStr);
+
   try {
+    const targetMedia = media || await getMediaForTrack(idStr);
+    if (!targetMedia) return;
+
     const iter = client.iterDownload({
-      file: media,
+      file: targetMedia,
       offset: bigInt(0),
       requestSize: FAST_START_BYTES,
     });
     for await (const chunk of iter) {
       const preamble = chunk.slice(0, FAST_START_BYTES);
-      fastStartCache.set(trackId, preamble);
+      fastStartCache.set(idStr, preamble);
       const prewarmKb = Math.round(preamble.length / 1024);
-      const trackLabel = title ? `"${title}" (ID: ${trackId})` : `track ${trackId}`;
-      console.log(`[FastStart] Lookahead pre-warmed ${prewarmKb} KB for upcoming ${trackLabel}`);
+      const trackLabel = title ? `"${title}" (ID: ${idStr})` : `track ${idStr}`;
+      console.log(`[FastStart] Pre-warmed ${prewarmKb} KB for queued ${trackLabel}`);
       iter.left = 0;
       await iter.close().catch(() => {});
       break;
     }
   } catch (err) {
-    console.warn(`[FastStart] Lookahead pre-warm skipped for track ${trackId}: ${err.message}`);
+    console.warn(`[FastStart] Pre-warm skipped for track ${idStr}: ${err.message}`);
+  } finally {
+    inFlightPrewarms.delete(idStr);
   }
 }
 
@@ -312,19 +323,15 @@ async function prewarmUpcomingTracks(currentTrackId) {
     const currentIdx = trackIndex.findIndex((t) => t.id === thisId);
     if (currentIdx === -1) return;
 
-    // Look ahead to the upcoming 7 tracks (2 played + 1 current + 7 upcoming = 10 total)
-    const nextTracks = trackIndex.slice(currentIdx + 1, currentIdx + 8);
-    for (const next of nextTracks) {
-      // If user skipped to a new song, abort old lookahead immediately
-      if (currentLookaheadTrackId !== thisId) break;
-      if (fastStartCache.has(next.id)) continue;
-
-      const media = await getMediaForTrack(next.id);
-      if (!media) continue;
-
-      await prewarmTrackPreamble(next.id, media, next.title);
-      // Gentle 600ms spacing
-      await new Promise((r) => setTimeout(r, 600));
+    // Gentle 1-track sequential lookahead for album listening (BitChord queue tracks are pre-warmed via /stream)
+    const nextTrack = trackIndex[currentIdx + 1];
+    if (nextTrack) {
+      const nextExisting = fastStartCache.get(nextTrack.id);
+      if (!nextExisting || nextExisting.length < FAST_START_BYTES) {
+        if (currentLookaheadTrackId === thisId) {
+          await prewarmTrackPreamble(nextTrack.id, null, nextTrack.title);
+        }
+      }
     }
   } catch (err) {
     console.warn('[FastStart] Lookahead error:', err.message);
@@ -1407,6 +1414,12 @@ app.get('/stream/:id', (req, res) => {
 
   if (track) {
     console.log(`[Playback] "${track.title}" by ${track.artist} [${isAtmos ? 'Dolby Atmos' : (track.quality || track.format)}]`);
+    const cached = fastStartCache.get(req.params.id);
+    if (!cached || cached.length < FAST_START_BYTES) {
+      setImmediate(() => {
+        prewarmTrackPreamble(req.params.id, null, track.title).catch(() => {});
+      });
+    }
   }
 
   recordRequest({
@@ -1619,7 +1632,7 @@ app.get('/audio/:id', async (req, res) => {
         const needed = FAST_START_BYTES - preambleBytesCollected;
         preambleChunks.push(chunk.slice(0, needed));
         preambleBytesCollected += Math.min(chunk.length, needed);
-        if (preambleBytesCollected >= FAST_START_BYTES || bytesSent + chunk.length >= bytesNeeded) {
+        if (preambleBytesCollected >= FAST_START_BYTES || preambleBytesCollected >= totalSize) {
           const fullPreamble = Buffer.concat(preambleChunks);
           fastStartCache.set(req.params.id, fullPreamble);
           const capturedKb = Math.round(fullPreamble.length / 1024);

@@ -8,8 +8,7 @@ BitChord searches this server whenever a track is requested. If the track is pre
 
 - **Free storage & no quotas**: Unlimited audio storage with zero daily bandwidth limits or playback throttling.
 - **Direct FLAC and Dolby Atmos streaming**: HTTP 206 range requests pull 64KB to 512KB slices on demand for instant ExoPlayer seeking without re-encoding.
-- **Fast-start preamble cache**: Holds 512KB headers in RAM for recently played and upcoming tracks. BitChord audition checks and song starts respond in sub-50ms (under 10ms from RAM).
-- **Rolling lookahead cache**: Keeps a 10-track window (2 previous, 1 playing, 7 upcoming) using bounded LRU maps. Preamble downloads run in the background with 600ms pauses between files to avoid Telegram rate limits.
+- **Queue-aware rolling cache**: Keeps a 10-track rolling window using bounded LRU maps. Automatically pre-warms the 512KB preamble whenever BitChord queues or prepares an upcoming song, with a gentle 1-track lookahead for sequential album listening.
 - **Dolby Atmos spatial audio**: Streams immersive E-AC-3 JOC audio in MP4 containers with automatic tag detection and `?atmos=auto` preference support.
 - **Interactive `/s` search**: Search Deezer with `/s <name>` to browse 7 tracks per page, navigate with inline buttons, and download FLACs directly. For full playlists, paste the link in your private chat with `@MusicsHuntersbot`.
 - **In-memory indexing**: Keeps library metadata in RAM for sub-50ms search response (under 10ms from RAM).
