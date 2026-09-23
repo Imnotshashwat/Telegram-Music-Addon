@@ -1,22 +1,18 @@
-# Sensitive credentials - NEVER COMMIT
 .env
 .env.*
 !.env.example
 
-# Node dependencies
 node_modules/
 
-# Logs
 *.log
 npm-debug.log*
 
-# OS / Editor files
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
 
-# Internal agent / local scratch files
 tasks/
 scratch/
 notification_state.json
+tracks_cache.json

@@ -147,7 +147,7 @@ Set the following environment variables in your deployment dashboard:
 
 #### Protecting your public deployment with URL_SECRET (optional)
 
-When hosting TeleMusic on a public URL (Render, Fly.io, or a Cloudflare tunnel), automated web bots or strangers could find your domain and stream files through your Telegram account. Setting a secret path token locks the server so only your devices can access it.
+When hosting Telegram Music Addon on a public URL (Render, Fly.io, or a Cloudflare tunnel), automated web bots or strangers could find your domain and stream files through your Telegram account. Setting a secret path token locks the server so only your devices can access it.
 
 1. **Setting the secret**:
    - **Locally**: Add `URL_SECRET=your_secret` to your `.env` file (for example, `URL_SECRET=mysecret123`).

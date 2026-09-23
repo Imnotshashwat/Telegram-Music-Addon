@@ -180,6 +180,9 @@ function recordRequest(entry) {
   if (recentRequests.length > 50) recentRequests.pop();
 }
 
+let currentlyPlayingTrackId = null;
+let lastPlaybackLogTime = 0;
+
 function loadCache() {
   try {
     if (fs.existsSync(CACHE_FILE)) {
@@ -275,8 +278,8 @@ async function getHeaderChunk(media, maxBytes = 128 * 1024) {
   }
 }
 
-let isLookaheadRunning = false;
 const inFlightPrewarms = new Set();
+const inFlightPrewarmIters = new Map();
 
 async function prewarmTrackPreamble(trackId, media, title) {
   const idStr = String(trackId);
@@ -294,49 +297,31 @@ async function prewarmTrackPreamble(trackId, media, title) {
       offset: bigInt(0),
       requestSize: FAST_START_BYTES,
     });
+    inFlightPrewarmIters.set(idStr, iter);
+
     for await (const chunk of iter) {
+      if (!inFlightPrewarmIters.has(idStr)) {
+        iter.left = 0;
+        await iter.close().catch(() => {});
+        break;
+      }
       const preamble = chunk.slice(0, FAST_START_BYTES);
       fastStartCache.set(idStr, preamble);
       const prewarmKb = Math.round(preamble.length / 1024);
-      const trackLabel = title ? `"${title}" (ID: ${idStr})` : `track ${idStr}`;
-      console.log(`[FastStart] Pre-warmed ${prewarmKb} KB for queued ${trackLabel}`);
+      const trackObj = findTrack(idStr);
+      const trackTitle = trackObj?.title || title || 'track';
+      console.log(`[FastStart] Pre-warmed ${prewarmKb} KB for "${trackTitle}" (ID: ${idStr})`);
       iter.left = 0;
       await iter.close().catch(() => {});
       break;
     }
   } catch (err) {
-    console.warn(`[FastStart] Pre-warm skipped for track ${idStr}: ${err.message}`);
-  } finally {
-    inFlightPrewarms.delete(idStr);
-  }
-}
-
-let currentLookaheadTrackId = null;
-
-async function prewarmUpcomingTracks(currentTrackId) {
-  currentLookaheadTrackId = String(currentTrackId);
-  const thisId = currentLookaheadTrackId;
-
-  if (isLookaheadRunning) return;
-  isLookaheadRunning = true;
-  try {
-    const currentIdx = trackIndex.findIndex((t) => t.id === thisId);
-    if (currentIdx === -1) return;
-
-    // Gentle 1-track sequential lookahead for album listening (BitChord queue tracks are pre-warmed via /stream)
-    const nextTrack = trackIndex[currentIdx + 1];
-    if (nextTrack) {
-      const nextExisting = fastStartCache.get(nextTrack.id);
-      if (!nextExisting || nextExisting.length < FAST_START_BYTES) {
-        if (currentLookaheadTrackId === thisId) {
-          await prewarmTrackPreamble(nextTrack.id, null, nextTrack.title);
-        }
-      }
+    if (inFlightPrewarmIters.has(idStr)) {
+      console.warn(`[FastStart] Pre-warm skipped for track ${idStr}: ${err.message}`);
     }
-  } catch (err) {
-    console.warn('[FastStart] Lookahead error:', err.message);
   } finally {
-    isLookaheadRunning = false;
+    inFlightPrewarmIters.delete(idStr);
+    inFlightPrewarms.delete(idStr);
   }
 }
 
@@ -551,6 +536,11 @@ function isDuplicate(a, b) {
   // Preserve both Dolby Atmos and stereo mixes
   if (Boolean(a.isAtmos) !== Boolean(b.isAtmos)) {
     return false;
+  }
+
+  // Exact ISRC match: identical master recording
+  if (a.isrc && b.isrc && String(a.isrc).trim().toUpperCase() === String(b.isrc).trim().toUpperCase()) {
+    return true;
   }
 
   if (a.duration && b.duration && Math.abs(a.duration - b.duration) > 15) {
@@ -1221,23 +1211,50 @@ function scoreTrackMatch(track, qContext) {
 
   const { qClean, queryCore, queryTokens, wordRegex } = ctx;
   if (!qClean) return 100;
+
+  // Exact ISRC match (if search query matches track ISRC)
+  if (track.isrc && qClean && String(track.isrc).trim().toLowerCase() === qClean) {
+    return 350;
+  }
+
   const trackTitle = (track.title || '').toLowerCase();
   const trackTitleCore = extractCoreTitle(track.title);
+  const titleTokens = trackTitleCore.split(/\s+/).filter(Boolean);
   const trackArtist = (track.artist || '').toLowerCase();
   const trackAlbum = (track.album || '').toLowerCase();
 
-  // Exact core title match (e.g. "ada" matches "Ada (From Garam Masala)")
-  if (queryCore && queryCore === trackTitleCore) {
+  const queryCoreCompact = queryCore.replace(/\s+/g, '');
+  const trackTitleCoreCompact = trackTitleCore.replace(/\s+/g, '');
+
+  // Exact core title match (e.g. "ada" matches "Ada (From Garam Masala)" or "antihero" matches "Anti-Hero")
+  if (queryCore && (queryCore === trackTitleCore || (queryCoreCompact && queryCoreCompact === trackTitleCoreCompact))) {
     return 300;
   }
 
-  // Query is "title artist" and matches core title + primary artist
-  if (queryCore.startsWith(trackTitleCore) || trackTitleCore.startsWith(queryCore)) {
-    const extraWords = queryCore.replace(trackTitleCore, '').trim();
-    if (!extraWords) return 250;
-    if (trackArtist.includes(extraWords) || sharesArtist(extraWords, track.artist)) return 280;
-    if (trackAlbum && trackAlbum.includes(extraWords)) return 220;
-    return 180;
+  // Query is "title artist" at word boundary
+  if (queryCore && trackTitleCore) {
+    const isTitlePrefix = queryCore.startsWith(trackTitleCore + ' ') ||
+      (trackTitleCoreCompact && queryCore.startsWith(trackTitleCoreCompact + ' '));
+    if (isTitlePrefix) {
+      const extraWords = queryCore.startsWith(trackTitleCore + ' ')
+        ? queryCore.slice(trackTitleCore.length).trim()
+        : queryCore.slice(trackTitleCoreCompact.length).trim();
+      if (!extraWords) return 250;
+      if (trackArtist.includes(extraWords) || sharesArtist(extraWords, track.artist)) return 280;
+      if (trackAlbum && trackAlbum.includes(extraWords)) return 220;
+      if (trackTitle.includes(extraWords)) return 200;
+      const extraTokens = extraWords.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((w) => w.length > 1);
+      const hasArtistToken = extraTokens.some((w) => trackArtist.includes(w) || sharesArtist(w, track.artist));
+      const hasAlbumToken = extraTokens.some((w) => trackAlbum.includes(w));
+      if (hasArtistToken) return 260;
+      if (hasAlbumToken) return 210;
+      // Multi-word title prefix matched completely (e.g. "tu hi mera pritam" where composer is not in artist tag)
+      if (titleTokens.length >= 2 || trackTitleCore.length >= 8) {
+        return 175;
+      }
+    } else if (trackTitleCore.startsWith(queryCore + ' ') || (queryCoreCompact && trackTitleCoreCompact.startsWith(queryCoreCompact + ' '))) {
+      return 180;
+    }
   }
 
   // Whole word match in title (e.g. "ada" as an isolated word)
@@ -1245,17 +1262,36 @@ function scoreTrackMatch(track, qContext) {
     return 200;
   }
 
-  // Token matching without Set allocations
-  const titleTokens = trackTitleCore.split(/\s+/).filter(Boolean);
+  // Token matching: when track title is fully inside query tokens
   if (titleTokens.length > 0 && titleTokens.every((tw) => queryTokens.includes(tw))) {
-    const hasArtistToken = queryTokens.some((qw) => !titleTokens.includes(qw) && trackArtist.includes(qw));
-    return hasArtistToken ? 210 : 170;
+    const extraTokens = queryTokens.filter((qw) => !titleTokens.includes(qw));
+    if (extraTokens.length === 0) return 250;
+    const hasArtistToken = extraTokens.some((qw) => trackArtist.includes(qw) || sharesArtist(qw, track.artist));
+    const hasAlbumToken = extraTokens.some((qw) => trackAlbum.includes(qw));
+    if (hasArtistToken) return 210;
+    if (hasAlbumToken) return 190;
+    // Multi-word title matched completely, but extra tokens are in query (e.g. uncredited composer or mix)
+    if (titleTokens.length >= 2 || trackTitleCore.length >= 8) {
+      return 170;
+    }
+    // Extra tokens are unrecognized (not in artist or album) and title is single-word, meaning query is for a longer song (e.g. "hale dil" vs "dil")!
+    return 0;
   }
+
+  // Token matching: whole-word matching to avoid short substrings falsely matching inside words (e.g. 'hi' inside 'hit')
+  const trackWords = [
+    ...trackTitleCore.split(/[^a-z0-9]+/),
+    ...trackArtist.split(/[^a-z0-9]+/),
+    ...trackAlbum.split(/[^a-z0-9]+/)
+  ].filter(Boolean);
+  const trackWordSet = new Set(trackWords);
 
   let matchCount = 0;
   for (let i = 0; i < queryTokens.length; i++) {
     const tok = queryTokens[i];
-    if (trackTitleCore.includes(tok) || trackArtist.includes(tok) || trackAlbum.includes(tok)) {
+    if (trackWordSet.has(tok)) {
+      matchCount++;
+    } else if (tok.length >= 4 && trackWords.some((tw) => tw.startsWith(tok) || tok.startsWith(tw))) {
       matchCount++;
     }
   }
@@ -1324,7 +1360,7 @@ app.get('/search', async (req, res) => {
       const wordRegex = escapedCore ? new RegExp(`\\b${escapedCore}\\b`, 'i') : null;
       const qContext = { qClean: q, queryCore, queryTokens, wordRegex };
 
-      matches = trackIndex
+      const scoredCandidates = trackIndex
         .map((t) => {
           let score = scoreTrackMatch(t, qContext);
           if (score > 0 && prefersAtmos && t.isAtmos) {
@@ -1333,15 +1369,27 @@ app.get('/search', async (req, res) => {
           return { track: t, score };
         })
         .filter((item) => item.score > 0)
-        .sort((a, b) => b.score - a.score)
-        .map((item) => item.track);
+        .sort((a, b) => b.score - a.score);
+
+      matches = scoredCandidates.map((item) => item.track);
+
+      // Pre-warm top match on confident search hits (score >= 200: exact core title or title+artist match)
+      if (scoredCandidates.length > 0 && scoredCandidates[0].score >= 200) {
+        const top = scoredCandidates[0].track;
+        const cached = fastStartCache.get(top.id);
+        if (!cached || cached.length < FAST_START_BYTES) {
+          setImmediate(() => {
+            prewarmTrackPreamble(top.id, null, top.title).catch(() => {});
+          });
+        }
+      }
     } else if (prefersAtmos) {
       matches = [...trackIndex].sort((a, b) => (b.isAtmos ? 1 : 0) - (a.isAtmos ? 1 : 0));
     }
 
     const elapsed = Date.now() - startTime;
     if (q) {
-      const topStr = matches[0] ? ` -> Top match: "${matches[0].title}" by ${matches[0].artist}` : ' -> No match';
+      const topStr = matches[0] ? ` -> Top match: "${matches[0].title}" (ID: ${matches[0].id})` : ' -> No match';
       console.log(`[Search] "${q}" (${matches.length} found, ${elapsed}ms)${topStr}`);
     }
     recordRequest({
@@ -1380,7 +1428,7 @@ function handleIsrcLookup(req, res) {
     (t) => t.isrc && String(t.isrc).trim().toUpperCase() === cleanCode
   );
 
-  const topStr = matches[0] ? ` -> Matched: "${matches[0].title}" by ${matches[0].artist}` : ' -> No match';
+  const topStr = matches[0] ? ` -> Matched: "${matches[0].title}" (ID: ${matches[0].id})` : ' -> No match';
   console.log(`[ISRC] "${cleanCode}" (${matches.length} found)${topStr}`);
 
   recordRequest({
@@ -1413,7 +1461,7 @@ app.get('/stream/:id', (req, res) => {
   const isAtmos = Boolean(track?.isAtmos);
 
   if (track) {
-    console.log(`[Playback] "${track.title}" by ${track.artist} [${isAtmos ? 'Dolby Atmos' : (track.quality || track.format)}]`);
+    console.log(`[Queue Ready] "${track.title}" [${isAtmos ? 'Dolby Atmos' : (track.quality || track.format)}]`);
     const cached = fastStartCache.get(req.params.id);
     if (!cached || cached.length < FAST_START_BYTES) {
       setImmediate(() => {
@@ -1506,6 +1554,16 @@ app.get('/audio/:id', async (req, res) => {
 
     if (isConnectionClosed) return;
 
+    // If a background pre-warm is currently running for this track, cancel it to prevent duplicate MTProto downloads
+    if (inFlightPrewarmIters.has(req.params.id)) {
+      const bgIter = inFlightPrewarmIters.get(req.params.id);
+      inFlightPrewarmIters.delete(req.params.id);
+      if (bgIter) {
+        bgIter.left = 0;
+        if (typeof bgIter.close === 'function') bgIter.close().catch(() => {});
+      }
+    }
+
     const totalSize = Number(track.sizeBytes) || Number(media.document?.size) || 0;
     if (!totalSize || isNaN(totalSize)) {
       console.error(`Invalid totalSize for track ${req.params.id}`);
@@ -1545,9 +1603,19 @@ app.get('/audio/:id', async (req, res) => {
     end = Math.max(start, Math.min(end, totalSize - 1));
     const bytesNeeded = end - start + 1;
 
-    if (start === 0 || !isRange) {
-      const sizeMb = (totalSize / (1024 * 1024)).toFixed(1);
-      console.log(`[Streaming] "${track.title}" (${sizeMb} MB) | Starting audio playback`);
+    const isAudition = (start === 0 && bytesNeeded <= 128 * 1024);
+    const isPlaybackStart = (start <= 128 * 1024 && bytesNeeded > 128 * 1024);
+
+    if (isAudition) {
+      console.log(`[Audition] "${track.title}" (ID: ${track.id}) (${Math.round(bytesNeeded / 1024)} KB probe)`);
+    } else if (isPlaybackStart) {
+      const now = Date.now();
+      if (currentlyPlayingTrackId !== track.id || (now - lastPlaybackLogTime > 4000)) {
+        currentlyPlayingTrackId = track.id;
+        lastPlaybackLogTime = now;
+        const sizeMb = (totalSize / (1024 * 1024)).toFixed(1);
+        console.log(`[Playback] "${track.title}" (ID: ${track.id}) (${sizeMb} MB) [${track.isAtmos ? 'Dolby Atmos' : (track.quality || track.format)}]`);
+      }
     }
 
     recordRequest({
@@ -1578,7 +1646,6 @@ app.get('/audio/:id', async (req, res) => {
 
     // Fast-Start RAM cache check
     let bytesSent = 0;
-    let lookaheadTriggered = false;
 
     const waitForDrain = () => new Promise((resolve) => {
       const onDrain = () => { req.removeListener('close', onClose); resolve(); };
@@ -1588,11 +1655,12 @@ app.get('/audio/:id', async (req, res) => {
     });
 
     const cachedPreamble = fastStartCache.get(req.params.id);
-    const useFastStart = (start === 0) && cachedPreamble && cachedPreamble.length > 0;
+    const isPreambleStart = (start === 0 || start === 65536);
+    const useFastStart = isPreambleStart && cachedPreamble && (start < cachedPreamble.length);
 
     if (useFastStart) {
       // 1. Immediately flush cached preamble from RAM (<5ms start)
-      const preambleSlice = cachedPreamble.slice(0, Math.min(cachedPreamble.length, bytesNeeded));
+      const preambleSlice = cachedPreamble.slice(start, Math.min(cachedPreamble.length, start + bytesNeeded));
       const canContinue = res.write(preambleSlice);
       bytesSent += preambleSlice.length;
 
@@ -1629,15 +1697,20 @@ app.get('/audio/:id', async (req, res) => {
 
       // On cache miss at start === 0, capture the first 512KB for future instant playback
       if (start === 0 && !useFastStart && preambleBytesCollected < FAST_START_BYTES) {
-        const needed = FAST_START_BYTES - preambleBytesCollected;
-        preambleChunks.push(chunk.slice(0, needed));
-        preambleBytesCollected += Math.min(chunk.length, needed);
-        if (preambleBytesCollected >= FAST_START_BYTES || preambleBytesCollected >= totalSize) {
-          const fullPreamble = Buffer.concat(preambleChunks);
-          fastStartCache.set(req.params.id, fullPreamble);
-          const capturedKb = Math.round(fullPreamble.length / 1024);
-          const trackLabel = track ? `"${track.title}" (ID: ${req.params.id})` : `track ${req.params.id}`;
-          console.log(`[FastStart] Captured ${capturedKb} KB preamble for ${trackLabel}`);
+        if (fastStartCache.has(req.params.id)) {
+          preambleBytesCollected = FAST_START_BYTES;
+          preambleChunks.length = 0;
+        } else {
+          const needed = FAST_START_BYTES - preambleBytesCollected;
+          preambleChunks.push(chunk.slice(0, needed));
+          preambleBytesCollected += Math.min(chunk.length, needed);
+          if (preambleBytesCollected >= FAST_START_BYTES || preambleBytesCollected >= totalSize) {
+            const fullPreamble = Buffer.concat(preambleChunks);
+            fastStartCache.set(req.params.id, fullPreamble);
+            const capturedKb = Math.round(fullPreamble.length / 1024);
+            const trackTitle = track?.title || 'track';
+            console.log(`[FastStart] Captured ${capturedKb} KB preamble for "${trackTitle}" (ID: ${req.params.id})`);
+          }
         }
       }
 
@@ -1652,14 +1725,6 @@ app.get('/audio/:id', async (req, res) => {
       bytesSent += toSend.length;
       if (bytesSent >= bytesNeeded) {
         shouldBreak = true;
-      }
-
-      // Trigger gentle lookahead for upcoming 2 tracks after 1MB has streamed smoothly
-      if (!lookaheadTriggered && bytesSent >= 1024 * 1024) {
-        lookaheadTriggered = true;
-        setImmediate(() => {
-          prewarmUpcomingTracks(req.params.id).catch(() => {});
-        });
       }
 
       // Handle backpressure: pause pulling chunks if client network buffer is full
