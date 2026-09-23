@@ -8,9 +8,11 @@ BitChord searches this server whenever a track is requested. If the track is pre
 
 - **Free storage & no quotas**: Unlimited audio storage with zero daily bandwidth limits or playback throttling.
 - **Direct FLAC and Dolby Atmos streaming**: HTTP 206 range requests pull 64KB to 512KB slices on demand for instant ExoPlayer seeking without re-encoding.
+- **Fast-start preamble cache**: Holds 512KB headers in RAM for recently played and upcoming tracks. BitChord audition checks and song starts respond in sub-50ms (under 10ms from RAM).
+- **Rolling lookahead cache**: Keeps a 10-track window (2 previous, 1 playing, 7 upcoming) using bounded LRU maps. Preamble downloads run in the background with 600ms pauses between files to avoid Telegram rate limits.
 - **Dolby Atmos spatial audio**: Streams immersive E-AC-3 JOC audio in MP4 containers with automatic tag detection and `?atmos=auto` preference support.
 - **Interactive `/s` search**: Search Deezer with `/s <name>` to browse 7 tracks per page, navigate with inline buttons, and download FLACs directly. For full playlists, paste the link in your private chat with `@MusicsHuntersbot`.
-- **In-memory indexing**: Keeps library metadata in RAM for sub-10ms search response.
+- **In-memory indexing**: Keeps library metadata in RAM for sub-50ms search response (under 10ms from RAM).
 - **Title & artist matching**: Normalizes titles and composer duos to match BitChord and YouTube Music queries.
 - **ISRC matching**: Direct lookup by recording code for exact track identification.
 - **Quality deduplication**: Automatically keeps higher-quality audio files when duplicates appear while preserving Dolby Atmos mixes alongside stereo lossless copies (exempt files with `/keep`).
@@ -176,7 +178,7 @@ If hosting on a free provider that sleeps after inactivity (like Render's free t
   https://<your-service-name>.onrender.com/ping
   ```
 * Set the interval to **every 10 minutes**.
-* This keeps the server constantly awake, eliminating sleep latency and ensuring sub-10ms search responses so Telegram FLAC always wins the upgrade race instantly.
+* This keeps the server constantly awake, eliminating sleep latency and ensuring sub-50ms search responses (under 10ms from RAM) so Telegram FLAC always wins the upgrade race instantly.
 
 ### 6. Add to BitChord
 
@@ -190,7 +192,7 @@ If hosting on a free provider that sleeps after inactivity (like Render's free t
 When `URL_SECRET` is set, all endpoints except `/ping` and `/icon.png` require the `/:secret` prefix (for example, `/:secret/manifest.json` or `/:secret/search`).
 
 - `GET /manifest.json`: Addon metadata and supported capabilities.
-- `GET /search?q=:query&atmos=auto`: Sub-10ms in-memory search across indexed tracks with optional Dolby Atmos prioritization.
+- `GET /search?q=:query&atmos=auto`: Sub-50ms in-memory search across indexed tracks (under 10ms from RAM) with optional Dolby Atmos prioritization.
 - `GET /isrc/:code`: Exact track match by ISRC recording code (BitChord).
 - `GET /resolve-isrc?isrc=:code`: Exact track match by ISRC recording code (Eclipse Music).
 - `GET /stream/:id`: Stream metadata (FLAC or E-AC-3 JOC MP4) and direct audio playback URL.
@@ -200,8 +202,5 @@ When `URL_SECRET` is set, all endpoints except `/ping` and `/icon.png` require t
 - `GET /notifications/status`: Check deduplication status and active notification mode (`silent` or `active`).
 - `GET /notifications/flush`: Manually trigger library cleanup digest flush.
 - `GET /debug/requests`: Live log buffer of the last 50 incoming requests.
+- `GET /debug/faststart`: Current state of the 10-track preamble cache and pre-warmed tracks.
 - `GET /ping`: Uptime monitor heartbeat (always public).
-
-## License
-
-This project is licensed under the [MIT License](LICENSE).

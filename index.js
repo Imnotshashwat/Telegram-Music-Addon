@@ -129,8 +129,49 @@ let channelEntity = null;
 let trackIndex = [];
 let lastIndexed = 0;
 
-const mediaCache = new Map();
-const fastStartCache = new Map();
+// ── Lightweight O(1) LRU Cache (Zero External Dependencies) ─────────────
+class SimpleLRU {
+  constructor(maxSize) {
+    this.maxSize = maxSize;
+    this.map = new Map();
+  }
+  get(key) {
+    const k = String(key);
+    if (!this.map.has(k)) return undefined;
+    const val = this.map.get(k);
+    this.map.delete(k);
+    this.map.set(k, val);
+    return val;
+  }
+  set(key, val) {
+    const k = String(key);
+    if (this.map.has(k)) {
+      this.map.delete(k);
+    } else if (this.map.size >= this.maxSize) {
+      const oldestKey = this.map.keys().next().value;
+      this.map.delete(oldestKey);
+    }
+    this.map.set(k, val);
+  }
+  has(key) {
+    return this.map.has(String(key));
+  }
+  delete(key) {
+    return this.map.delete(String(key));
+  }
+  clear() {
+    this.map.clear();
+  }
+  get size() {
+    return this.map.size;
+  }
+  keys() {
+    return Array.from(this.map.keys());
+  }
+}
+
+const mediaCache = new SimpleLRU(1000);
+const fastStartCache = new SimpleLRU(10);
 const FAST_START_BYTES = 512 * 1024;
 
 const recentRequests = [];
@@ -234,45 +275,62 @@ async function getHeaderChunk(media, maxBytes = 128 * 1024) {
   }
 }
 
-async function prewarmFastStart(trackId, media) {
+let isLookaheadRunning = false;
+
+async function prewarmTrackPreamble(trackId, media, title) {
   if (fastStartCache.has(trackId)) return;
-  const chunks = [];
-  let downloaded = 0;
   try {
     const iter = client.iterDownload({
       file: media,
       offset: bigInt(0),
-      requestSize: 512 * 1024,
+      requestSize: FAST_START_BYTES,
     });
     for await (const chunk of iter) {
-      chunks.push(chunk);
-      downloaded += chunk.length;
-      if (downloaded >= FAST_START_BYTES) {
-        iter.left = 0;
-        await iter.close();
-        break;
-      }
-    }
-    const buf = Buffer.concat(chunks).slice(0, FAST_START_BYTES);
-    if (buf.length > 0) {
-      fastStartCache.set(trackId, buf);
-      console.log(`[FastStart] Pre-warmed ${buf.length} bytes for track ${trackId}`);
+      const preamble = chunk.slice(0, FAST_START_BYTES);
+      fastStartCache.set(trackId, preamble);
+      const prewarmKb = Math.round(preamble.length / 1024);
+      const trackLabel = title ? `"${title}" (ID: ${trackId})` : `track ${trackId}`;
+      console.log(`[FastStart] Lookahead pre-warmed ${prewarmKb} KB for upcoming ${trackLabel}`);
+      iter.left = 0;
+      await iter.close().catch(() => {});
+      break;
     }
   } catch (err) {
-    console.warn(`[FastStart] Pre-warm failed for track ${trackId}: ${err.message}`);
+    console.warn(`[FastStart] Lookahead pre-warm skipped for track ${trackId}: ${err.message}`);
   }
 }
 
-async function prewarmAllTracks() {
-  console.log(`[FastStart] Starting pre-warm for ${trackIndex.length} track(s)...`);
-  for (const track of trackIndex) {
-    if (fastStartCache.has(track.id)) continue;
-    const media = mediaCache.get(track.id);
-    if (!media) continue;
-    await prewarmFastStart(track.id, media);
-    await new Promise((r) => setTimeout(r, 500));
+let currentLookaheadTrackId = null;
+
+async function prewarmUpcomingTracks(currentTrackId) {
+  currentLookaheadTrackId = String(currentTrackId);
+  const thisId = currentLookaheadTrackId;
+
+  if (isLookaheadRunning) return;
+  isLookaheadRunning = true;
+  try {
+    const currentIdx = trackIndex.findIndex((t) => t.id === thisId);
+    if (currentIdx === -1) return;
+
+    // Look ahead to the upcoming 7 tracks (2 played + 1 current + 7 upcoming = 10 total)
+    const nextTracks = trackIndex.slice(currentIdx + 1, currentIdx + 8);
+    for (const next of nextTracks) {
+      // If user skipped to a new song, abort old lookahead immediately
+      if (currentLookaheadTrackId !== thisId) break;
+      if (fastStartCache.has(next.id)) continue;
+
+      const media = await getMediaForTrack(next.id);
+      if (!media) continue;
+
+      await prewarmTrackPreamble(next.id, media, next.title);
+      // Gentle 600ms spacing
+      await new Promise((r) => setTimeout(r, 600));
+    }
+  } catch (err) {
+    console.warn('[FastStart] Lookahead error:', err.message);
+  } finally {
+    isLookaheadRunning = false;
   }
-  console.log(`[FastStart] Pre-warm complete: ${fastStartCache.size}/${trackIndex.length} track(s) cached.`);
 }
 
 async function parseTrackMessage(msg) {
@@ -301,12 +359,23 @@ async function parseTrackMessage(msg) {
   let bitDepth = undefined;
   let isrc = undefined;
 
-  const shouldSniffTags = (!audioAttr || !audioAttr.title || !audioAttr.performer || !isrc) && sizeBytes > 0;
+  const isMp4Container = ext === 'm4a' || ext === 'mp4';
+  const shouldSniffTags = (isMp4Container || !audioAttr || !audioAttr.title || !audioAttr.performer || !isrc) && sizeBytes > 0;
   let parsedCodec = null;
+  let hasEc3Atom = false;
+  let hasAlacAtom = false;
   if (shouldSniffTags) {
     try {
       const headerBuf = await getHeaderChunk(msg.media, Math.min(128 * 1024, sizeBytes));
       if (headerBuf && headerBuf.length > 0) {
+        if (isMp4Container) {
+          const headerStr = headerBuf.toString('latin1');
+          if (headerStr.includes('ec-3') || headerStr.includes('dec3')) {
+            hasEc3Atom = true;
+          } else if (headerStr.includes('alac')) {
+            hasAlacAtom = true;
+          }
+        }
         const parsed = await mm.parseBuffer(headerBuf, undefined, {
           duration: false,
           size: sizeBytes,
@@ -333,6 +402,7 @@ async function parseTrackMessage(msg) {
 
   const msgText = (msg.message || msg.text || '');
   const isAtmos = Boolean(
+    hasEc3Atom ||
     ATMOS_REGEX.test(fileName) ||
     ATMOS_REGEX.test(msgText) ||
     ATMOS_REGEX.test(title) ||
@@ -349,7 +419,7 @@ async function parseTrackMessage(msg) {
 
   if (isAtmos) {
     formatName = 'eac3-joc';
-  } else if (formatName === 'm4a' && (parsedCodec === 'ALAC' || rawKbps > 500)) {
+  } else if (formatName === 'm4a' && (hasAlacAtom || parsedCodec === 'ALAC' || rawKbps > 500)) {
     formatName = 'alac';
     if (!bitDepth) bitDepth = rawKbps > 2000 ? 24 : 16;
     if (!sampleRate) sampleRate = 48000;
@@ -1493,12 +1563,47 @@ app.get('/audio/:id', async (req, res) => {
     else if (bytesNeeded <= 128 * 1024) dynamicBlockSize = 128 * 1024;
     else if (bytesNeeded <= 256 * 1024) dynamicBlockSize = 256 * 1024;
 
-    // Stream directly from Telegram MTProto from the requested byte offset.
+    // Fast-Start RAM cache check
     let bytesSent = 0;
+    let lookaheadTriggered = false;
+
+    const waitForDrain = () => new Promise((resolve) => {
+      const onDrain = () => { req.removeListener('close', onClose); resolve(); };
+      const onClose = () => { res.removeListener('drain', onDrain); resolve(); };
+      res.once('drain', onDrain);
+      req.once('close', onClose);
+    });
+
+    const cachedPreamble = fastStartCache.get(req.params.id);
+    const useFastStart = (start === 0) && cachedPreamble && cachedPreamble.length > 0;
+
+    if (useFastStart) {
+      // 1. Immediately flush cached preamble from RAM (<5ms start)
+      const preambleSlice = cachedPreamble.slice(0, Math.min(cachedPreamble.length, bytesNeeded));
+      const canContinue = res.write(preambleSlice);
+      bytesSent += preambleSlice.length;
+
+      if (!canContinue && !res.writableEnded && !res.destroyed && !isConnectionClosed) {
+        await waitForDrain();
+      }
+
+      // If the request was completely satisfied by preamble (e.g. 64KB audition probe)
+      if (bytesSent >= bytesNeeded) {
+        if (!res.writableEnded && !isConnectionClosed) {
+          res.end();
+        }
+        return;
+      }
+    }
+
+    // 2. Stream remaining bytes live from Telegram MTProto
+    const liveOffset = start + bytesSent;
+    const preambleChunks = [];
+    let preambleBytesCollected = 0;
 
     iterator = client.iterDownload({
       file: media,
-      offset: bigInt(start),
+      offset: bigInt(liveOffset),
       requestSize: dynamicBlockSize,
     });
 
@@ -1507,6 +1612,20 @@ app.get('/audio/:id', async (req, res) => {
         iterator.left = 0;
         await iterator.close().catch(() => {});
         break;
+      }
+
+      // On cache miss at start === 0, capture the first 512KB for future instant playback
+      if (start === 0 && !useFastStart && preambleBytesCollected < FAST_START_BYTES) {
+        const needed = FAST_START_BYTES - preambleBytesCollected;
+        preambleChunks.push(chunk.slice(0, needed));
+        preambleBytesCollected += Math.min(chunk.length, needed);
+        if (preambleBytesCollected >= FAST_START_BYTES || bytesSent + chunk.length >= bytesNeeded) {
+          const fullPreamble = Buffer.concat(preambleChunks);
+          fastStartCache.set(req.params.id, fullPreamble);
+          const capturedKb = Math.round(fullPreamble.length / 1024);
+          const trackLabel = track ? `"${track.title}" (ID: ${req.params.id})` : `track ${req.params.id}`;
+          console.log(`[FastStart] Captured ${capturedKb} KB preamble for ${trackLabel}`);
+        }
       }
 
       let toSend = chunk;
@@ -1522,21 +1641,18 @@ app.get('/audio/:id', async (req, res) => {
         shouldBreak = true;
       }
 
+      // Trigger gentle lookahead for upcoming 2 tracks after 1MB has streamed smoothly
+      if (!lookaheadTriggered && bytesSent >= 1024 * 1024) {
+        lookaheadTriggered = true;
+        setImmediate(() => {
+          prewarmUpcomingTracks(req.params.id).catch(() => {});
+        });
+      }
+
       // Handle backpressure: pause pulling chunks if client network buffer is full
       const canContinue = res.write(toSend);
       if (!canContinue && !res.writableEnded && !res.destroyed && !isConnectionClosed) {
-        await new Promise((resolve) => {
-          const onDrain = () => {
-            req.removeListener('close', onClose);
-            resolve();
-          };
-          const onClose = () => {
-            res.removeListener('drain', onDrain);
-            resolve();
-          };
-          res.once('drain', onDrain);
-          req.once('close', onClose);
-        });
+        await waitForDrain();
       }
 
       if (shouldBreak || isConnectionClosed) {
@@ -1583,20 +1699,26 @@ app.get('/debug/requests', (req, res) => {
   });
 });
 
-// Fast-Start cache inspection endpoint
+// Fast-Start & Media LRU cache inspection endpoint
 app.get('/debug/faststart', (req, res) => {
-  const entries = trackIndex.map((t) => ({
-    id: t.id,
-    title: t.title,
-    artist: t.artist,
-    cached: fastStartCache.has(t.id),
-    cachedBytes: fastStartCache.has(t.id) ? fastStartCache.get(t.id).length : 0,
-  }));
+  const cachedKeys = fastStartCache.keys();
+  const cachedTracks = cachedKeys.map((id) => {
+    const t = findTrack(id);
+    const buf = fastStartCache.get(id);
+    return {
+      id,
+      title: t?.title || 'Unknown',
+      artist: t?.artist || 'Unknown',
+      cachedBytes: buf ? buf.length : 0,
+    };
+  });
   res.json({
     fastStartCacheSize: fastStartCache.size,
-    totalTracks: trackIndex.length,
-    cachedBytes: FAST_START_BYTES,
-    tracks: entries,
+    fastStartCapacity: 10,
+    mediaCacheSize: mediaCache.size,
+    mediaCacheCapacity: 1000,
+    totalTracksInLibrary: trackIndex.length,
+    cachedTracks,
   });
 });
 
@@ -1889,6 +2011,19 @@ async function startBotCallbackPoller(botToken) {
 
     // Start 30-minute digest and 12-hour auto-deletion interval checker (checks every 5 minutes)
     setInterval(checkDigestSchedule, 5 * 60 * 1000);
+
+    // Telegram connection watchdog: keeps client alive and restarts if disconnected
+    setInterval(async () => {
+      try {
+        if (!client.connected) {
+          console.warn('[Watchdog] MTProto disconnected. Reconnecting...');
+          await client.connect();
+          console.log('[Watchdog] MTProto reconnected successfully.');
+        }
+      } catch (err) {
+        console.warn('[Watchdog] Reconnect failed:', err.message);
+      }
+    }, 15000);
 
     app.listen(PORT, '0.0.0.0', async () => {
       console.log(`BitChord Addon server running on http://0.0.0.0:${PORT}`);

@@ -9,7 +9,7 @@
   },
   "scripts": {
     "login": "node login.js",
-    "start": "node index.js"
+    "start": "node --max-old-space-size=128 index.js"
   },
   "dependencies": {
     "big-integer": "^1.6.52",
