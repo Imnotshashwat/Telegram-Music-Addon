@@ -61,7 +61,7 @@ if (!API_ID || !API_HASH || !SESSION_STRING || !CHANNEL) {
   process.exit(1);
 }
 
-const AUDIO_EXTENSIONS = ['flac', 'mp3', 'm4a', 'aac', 'wav', 'ogg', 'opus', 'alac', 'mp4', 'ec3', 'eac3'];
+const AUDIO_EXTENSIONS = ['flac', 'mp3', 'm4a', 'aac', 'wav', 'ogg', 'opus', 'alac', 'ec3', 'eac3'];
 const EXT_TO_FORMAT = {
   flac: 'flac',
   mp3: 'mp3',
@@ -71,7 +71,6 @@ const EXT_TO_FORMAT = {
   ogg: 'ogg',
   opus: 'opus',
   alac: 'alac',
-  mp4: 'mp4',
   ec3: 'eac3',
   eac3: 'eac3',
 };
@@ -84,6 +83,11 @@ function isAudioDocument(doc) {
   const fileNameAttr = doc.attributes?.find((a) => a.className === 'DocumentAttributeFilename');
   const fileName = fileNameAttr?.fileName || '';
   const ext = fileName.split('.').pop()?.toLowerCase() || '';
+
+  // Never treat video containers as audio documents
+  if (mime.startsWith('video/') || ['mp4', 'mkv', 'avi', 'mov', 'webm', 'flv'].includes(ext)) {
+    return false;
+  }
 
   const isAudioMime = mime.startsWith('audio/') || mime === 'application/ogg' || mime === 'application/x-flac';
   const isAudioExt = AUDIO_EXTENSIONS.includes(ext);
@@ -1081,15 +1085,46 @@ app.get('/icon.png', (req, res) => {
 // Manifest: BitChord queries this to verify addon id, name, and capabilities
 app.get('/manifest.json', (req, res) => {
   const base = getBaseUrl(req);
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=600');
   res.json({
     id: 'com.personal.telegrammusic',
     name: 'Telegram Music',
     version: `${pkg.version} • ${trackIndex.length} songs`,
     description: 'Personal hi-res, lossless, and high-quality music library streamed directly from Telegram',
     icon: `${base}/icon.png`,
+    canServeLossless: true,
+    canServeDolbyAtmos: true,
     resources: ['search', 'stream', 'isrc'],
     types: ['track'],
     contentType: 'music',
+    settings: [
+      {
+        key: 'quality',
+        type: 'select',
+        default: 'lossless',
+        options: [
+          { label: 'Lossless (FLAC/ALAC)', value: 'lossless' },
+          { label: 'High (320kbps MP3)', value: 'high' },
+          { label: 'Low (Data Saver)', value: 'low' },
+        ],
+      },
+      {
+        key: 'atmos',
+        type: 'select',
+        default: 'auto',
+        options: [
+          { label: 'Dolby Atmos (Spatial Audio)', value: 'auto' },
+          { label: 'Stereo Only', value: 'off' },
+        ],
+      },
+    ],
+    endpoints: {
+      search: `${base}/search?q={query}`,
+      isrc: `${base}/isrc/{isrc}`,
+      stream: `${base}/stream/{id}`,
+      audio: `${base}/audio/{id}`,
+    },
   });
 });
 
@@ -1152,7 +1187,7 @@ function extractCoreTitle(title) {
   let clean = title.toLowerCase();
   clean = clean.replace(BRACKETED_REGEX, ' ');
   clean = clean.replace(NOISE_WORDS_REGEX, ' ');
-  clean = clean.replace(/[^a-z0-9\s]/g, ' ');
+  clean = clean.replace(/[^\p{L}\p{N}\s]/gu, ' ');
   return clean.replace(/\s+/g, ' ').trim();
 }
 
@@ -1161,9 +1196,9 @@ function parseArtistTokens(artistStr) {
   const parts = artistStr.toLowerCase().split(ARTIST_SEPARATORS_REGEX);
   const result = [];
   for (const p of parts) {
-    const words = p.replace(/[^a-z0-9\s]/g, ' ')
+    const words = p.replace(/[^\p{L}\p{N}\s]/gu, ' ')
       .split(/\s+/)
-      .filter((w) => w.length > 1);
+      .filter((w) => w.length > 0);
     if (words.length > 0) {
       result.push(words);
     }
@@ -1204,17 +1239,18 @@ function scoreTrackMatch(track, qContext) {
     ? {
         qClean: qContext.toLowerCase().trim(),
         queryCore: extractCoreTitle(qContext.toLowerCase().trim()),
-        queryTokens: qContext.toLowerCase().trim().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((w) => w.length > 1),
+        queryTokens: qContext.toLowerCase().trim().replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter((w) => w.length > 0),
         wordRegex: null,
+        targetDuration: null,
       }
     : qContext;
 
-  const { qClean, queryCore, queryTokens, wordRegex } = ctx;
+  const { qClean, queryCore, queryTokens, wordRegex, targetDuration } = ctx;
   if (!qClean) return 100;
 
   // Exact ISRC match (if search query matches track ISRC)
   if (track.isrc && qClean && String(track.isrc).trim().toLowerCase() === qClean) {
-    return 350;
+    return 500;
   }
 
   const trackTitle = (track.title || '').toLowerCase();
@@ -1226,87 +1262,110 @@ function scoreTrackMatch(track, qContext) {
   const queryCoreCompact = queryCore.replace(/\s+/g, '');
   const trackTitleCoreCompact = trackTitleCore.replace(/\s+/g, '');
 
-  // Exact core title match (e.g. "ada" matches "Ada (From Garam Masala)" or "antihero" matches "Anti-Hero")
-  if (queryCore && (queryCore === trackTitleCore || (queryCoreCompact && queryCoreCompact === trackTitleCoreCompact))) {
-    return 300;
-  }
+  const cleanRawTitle = trackTitle.replace(/[^\p{L}\p{N}]/gu, '');
+  const cleanRawQuery = qClean.replace(/[^\p{L}\p{N}]/gu, '');
 
-  // Query is "title artist" at word boundary
-  if (queryCore && trackTitleCore) {
+  let baseScore = 0;
+
+  // Exact full title match (e.g. includes version tag like "(甜妹版)")
+  if (cleanRawTitle && cleanRawTitle === cleanRawQuery) {
+    baseScore = 350;
+  } else if (queryCore && trackTitleCore) {
+    // Query starts with title, followed by artist or extra keywords (e.g. "da da da 芊芊龍")
     const isTitlePrefix = queryCore.startsWith(trackTitleCore + ' ') ||
       (trackTitleCoreCompact && queryCore.startsWith(trackTitleCoreCompact + ' '));
     if (isTitlePrefix) {
       const extraWords = queryCore.startsWith(trackTitleCore + ' ')
         ? queryCore.slice(trackTitleCore.length).trim()
         : queryCore.slice(trackTitleCoreCompact.length).trim();
-      if (!extraWords) return 250;
-      if (trackArtist.includes(extraWords) || sharesArtist(extraWords, track.artist)) return 280;
-      if (trackAlbum && trackAlbum.includes(extraWords)) return 220;
-      if (trackTitle.includes(extraWords)) return 200;
-      const extraTokens = extraWords.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((w) => w.length > 1);
-      const hasArtistToken = extraTokens.some((w) => trackArtist.includes(w) || sharesArtist(w, track.artist));
-      const hasAlbumToken = extraTokens.some((w) => trackAlbum.includes(w));
-      if (hasArtistToken) return 260;
-      if (hasAlbumToken) return 210;
-      // Multi-word title prefix matched completely (e.g. "tu hi mera pritam" where composer is not in artist tag)
-      if (titleTokens.length >= 2 || trackTitleCore.length >= 8) {
-        return 175;
+      if (!extraWords) {
+        baseScore = 250;
+      } else if (trackArtist.includes(extraWords) || sharesArtist(extraWords, track.artist)) {
+        baseScore = 400; // Perfect match: Title + Artist!
+      } else if (trackAlbum && trackAlbum.includes(extraWords)) {
+        baseScore = 320;
+      } else if (trackTitle.includes(extraWords)) {
+        baseScore = 310;
+      } else {
+        const extraTokens = extraWords.replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter((w) => w.length > 0);
+        const hasArtistToken = extraTokens.some((w) => trackArtist.includes(w) || sharesArtist(w, track.artist));
+        const hasAlbumToken = extraTokens.some((w) => trackAlbum.includes(w));
+        if (hasArtistToken) {
+          baseScore = 380;
+        } else if (hasAlbumToken) {
+          baseScore = 300;
+        } else {
+          // Extra words belong to a different artist! Penalize so it cannot hijack the search
+          baseScore = 120;
+        }
       }
-    } else if (trackTitleCore.startsWith(queryCore + ' ') || (queryCoreCompact && trackTitleCoreCompact.startsWith(queryCoreCompact + ' '))) {
-      return 180;
     }
+  }
+
+  // Exact core title match (e.g. "ada" matches "Ada (From Garam Masala)")
+  if (baseScore === 0 && queryCore && (queryCore === trackTitleCore || (queryCoreCompact && queryCoreCompact === trackTitleCoreCompact))) {
+    baseScore = (track.title || '').includes('(') || (track.title || '').includes('[') ? 295 : 300;
   }
 
   // Whole word match in title (e.g. "ada" as an isolated word)
-  if (wordRegex && (wordRegex.test(trackTitleCore) || wordRegex.test(trackTitle))) {
-    return 200;
+  if (baseScore === 0 && wordRegex && (wordRegex.test(trackTitleCore) || wordRegex.test(trackTitle))) {
+    baseScore = 200;
   }
 
   // Token matching: when track title is fully inside query tokens
-  if (titleTokens.length > 0 && titleTokens.every((tw) => queryTokens.includes(tw))) {
+  if (baseScore === 0 && titleTokens.length > 0 && titleTokens.every((tw) => queryTokens.includes(tw))) {
     const extraTokens = queryTokens.filter((qw) => !titleTokens.includes(qw));
-    if (extraTokens.length === 0) return 250;
-    const hasArtistToken = extraTokens.some((qw) => trackArtist.includes(qw) || sharesArtist(qw, track.artist));
-    const hasAlbumToken = extraTokens.some((qw) => trackAlbum.includes(qw));
-    if (hasArtistToken) return 210;
-    if (hasAlbumToken) return 190;
-    // Multi-word title matched completely, but extra tokens are in query (e.g. uncredited composer or mix)
-    if (titleTokens.length >= 2 || trackTitleCore.length >= 8) {
-      return 170;
-    }
-    // Extra tokens are unrecognized (not in artist or album) and title is single-word, meaning query is for a longer song (e.g. "hale dil" vs "dil")!
-    return 0;
-  }
-
-  // Token matching: whole-word matching to avoid short substrings falsely matching inside words (e.g. 'hi' inside 'hit')
-  const trackWords = [
-    ...trackTitleCore.split(/[^a-z0-9]+/),
-    ...trackArtist.split(/[^a-z0-9]+/),
-    ...trackAlbum.split(/[^a-z0-9]+/)
-  ].filter(Boolean);
-  const trackWordSet = new Set(trackWords);
-
-  let matchCount = 0;
-  for (let i = 0; i < queryTokens.length; i++) {
-    const tok = queryTokens[i];
-    if (trackWordSet.has(tok)) {
-      matchCount++;
-    } else if (tok.length >= 4 && trackWords.some((tw) => tw.startsWith(tok) || tok.startsWith(tw))) {
-      matchCount++;
+    if (extraTokens.length === 0) {
+      baseScore = 250;
+    } else {
+      const hasArtistToken = extraTokens.some((qw) => trackArtist.includes(qw) || sharesArtist(qw, track.artist));
+      const hasAlbumToken = extraTokens.some((qw) => trackAlbum.includes(qw));
+      if (hasArtistToken) baseScore = 380;
+      else if (hasAlbumToken) baseScore = 300;
+      else if (titleTokens.length >= 2 || trackTitleCore.length >= 8) baseScore = 170;
     }
   }
-  const ratio = queryTokens.length > 0 ? matchCount / queryTokens.length : 0;
-  if (ratio >= 0.6) {
-    return Math.round(ratio * 120);
+
+  // Token matching: whole-word matching across title, artist, album
+  if (baseScore === 0) {
+    const trackWords = [
+      ...trackTitleCore.split(/[^\p{L}\p{N}]+/u),
+      ...trackArtist.split(/[^\p{L}\p{N}]+/u),
+      ...trackAlbum.split(/[^\p{L}\p{N}]+/u),
+    ].filter(Boolean);
+    const trackWordSet = new Set(trackWords);
+
+    let matchCount = 0;
+    for (let i = 0; i < queryTokens.length; i++) {
+      const tok = queryTokens[i];
+      if (trackWordSet.has(tok)) {
+        matchCount++;
+      } else if (tok.length >= 4 && trackWords.some((tw) => tw.startsWith(tok) || tok.startsWith(tw))) {
+        matchCount++;
+      }
+    }
+    const ratio = queryTokens.length > 0 ? matchCount / queryTokens.length : 0;
+    if (ratio >= 0.6) {
+      baseScore = Math.round(ratio * 120);
+    } else if (qClean.length >= 5) {
+      const fullText = `${trackTitle} ${trackArtist} ${trackAlbum}`;
+      if (fullText.includes(qClean)) baseScore = 60;
+    }
   }
 
-  // Substring match only if query is long enough (>= 5 chars) to prevent short word poisoning
-  if (qClean.length >= 5) {
-    const fullText = `${trackTitle} ${trackArtist} ${trackAlbum}`;
-    if (fullText.includes(qClean)) return 60;
+  // Duration proximity scoring (if duration is provided by client or caller)
+  if (baseScore > 0 && targetDuration && track.duration) {
+    const diff = Math.abs(track.duration - targetDuration);
+    if (diff <= 2) {
+      baseScore += 50; // High confidence duration match (within 2s)
+    } else if (diff <= 5) {
+      baseScore += 25; // Moderate duration match (within 5s)
+    } else if (diff > 15) {
+      baseScore = Math.max(10, baseScore - 80); // Major mismatch penalty (> 15s)
+    }
   }
 
-  return 0;
+  return baseScore;
 }
 
 async function onTrackForwarded(msg) {
@@ -1328,19 +1387,32 @@ async function onTrackForwarded(msg) {
 
 function formatTrackForClient(t, base) {
   const isAtmos = Boolean(t.isAtmos);
+  const fmt = (t.format || '').toLowerCase();
+  const isLossless = ['flac', 'alac', 'wav'].includes(fmt);
+  const isHiRes = isLossless && ((t.bitDepth && t.bitDepth > 16) || (t.sampleRate && t.sampleRate > 44100));
+  const qualityTier = isAtmos ? 'DOLBY_ATMOS' : (isHiRes ? 'HI_RES' : (isLossless ? 'LOSSLESS' : 'HIGH'));
+
   return {
-    id: t.id,
+    id: String(t.id),
     title: t.title,
     artist: formatArtistForClient(t.artist),
     album: t.album || '',
-    duration: t.duration,
+    duration: t.duration ? Math.round(t.duration) : undefined,
     format: isAtmos ? 'eac3-joc' : t.format,
-    audioQuality: isAtmos ? 'Dolby Atmos' : (t.quality || 'lossless'),
-    audioModes: isAtmos ? ['DOLBY_ATMOS'] : undefined,
+    audioQuality: qualityTier,
+    quality: qualityTier,
+    tier: qualityTier,
+    bitDepth: t.bitDepth || (isHiRes ? 24 : 16),
+    sampleRate: t.sampleRate || (isHiRes ? 96000 : 44100),
+    audioModes: isAtmos ? ['DOLBY_ATMOS'] : ['STEREO'],
     atmos: isAtmos ? true : undefined,
     artworkURL: t.hasArtwork ? `${base}/artwork/${t.id}` : undefined,
     albumArtworkURL: t.hasArtwork ? `${base}/artwork/${t.id}` : undefined,
+    stream: `${base}/stream/${t.id}`,
     streamURL: `${base}/audio/${t.id}`,
+    streamUrl: `${base}/audio/${t.id}`,
+    audio: `${base}/audio/${t.id}`,
+    audioUrl: `${base}/audio/${t.id}`,
     isrc: t.isrc,
   };
 }
@@ -1355,10 +1427,11 @@ app.get('/search', async (req, res) => {
     let matches = trackIndex;
     if (q) {
       const queryCore = extractCoreTitle(q);
-      const queryTokens = q.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((w) => w.length > 1);
-      const escapedCore = q.replace(/[^a-z0-9]/g, '');
+      const queryTokens = q.replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter((w) => w.length > 0);
+      const escapedCore = q.replace(/[^\p{L}\p{N}]/gu, '');
       const wordRegex = escapedCore ? new RegExp(`\\b${escapedCore}\\b`, 'i') : null;
-      const qContext = { qClean: q, queryCore, queryTokens, wordRegex };
+      const targetDuration = parseInt(req.query.duration || req.query.d, 10) || null;
+      const qContext = { qClean: q, queryCore, queryTokens, wordRegex, targetDuration };
 
       const scoredCandidates = trackIndex
         .map((t) => {
@@ -1402,6 +1475,9 @@ app.get('/search', async (req, res) => {
       topResult: matches[0] ? `${matches[0].title} - ${matches[0].artist} (${matches[0].duration}s)` : null,
       elapsedMs: elapsed,
     });
+
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
 
     res.json({
       tracks: matches.slice(0, 60).map((t) => formatTrackForClient(t, base)),
@@ -1459,6 +1535,10 @@ app.get('/stream/:id', (req, res) => {
   const track = findTrack(req.params.id);
   const base = getBaseUrl(req);
   const isAtmos = Boolean(track?.isAtmos);
+  const fmt = (track?.format || '').toLowerCase();
+  const isLossless = ['flac', 'alac', 'wav'].includes(fmt);
+  const isHiRes = isLossless && ((track?.bitDepth && track.bitDepth > 16) || (track?.sampleRate && track.sampleRate > 44100));
+  const qualityTier = isAtmos ? 'DOLBY_ATMOS' : (isHiRes ? 'HI_RES' : (isLossless ? 'LOSSLESS' : 'HIGH'));
 
   if (track) {
     console.log(`[Queue Ready] "${track.title}" [${isAtmos ? 'Dolby Atmos' : (track.quality || track.format)}]`);
@@ -1480,18 +1560,28 @@ app.get('/stream/:id', (req, res) => {
     atmos: isAtmos,
   });
 
+  if (!track) {
+    return res.status(404).json({ error: 'Track not found' });
+  }
+
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=300');
+
   res.json({
     url: `${base}/audio/${req.params.id}`,
-    format: isAtmos ? 'eac3-joc' : (track ? track.format : 'flac'),
-    codec: isAtmos ? 'eac3-joc' : (track ? track.format : 'flac'),
-    container: isAtmos ? 'mp4' : (track ? track.format : 'flac'),
+    format: isAtmos ? 'eac3-joc' : (track.format || 'flac'),
+    codec: isAtmos ? 'eac3-joc' : (track.format || 'flac'),
+    container: isAtmos ? 'mp4' : (track.format || 'flac'),
     manifest: 'none',
     encrypted: false,
-    audioMode: isAtmos ? 'DOLBY_ATMOS' : undefined,
-    sampleRate: track ? track.sampleRate : undefined,
-    bitDepth: track ? track.bitDepth : undefined,
-    quality: isAtmos ? 'Dolby Atmos' : (track ? track.quality : undefined),
-    streamQuality: isAtmos ? 'Dolby Atmos' : (track ? track.quality : undefined),
+    audioMode: isAtmos ? 'DOLBY_ATMOS' : 'STEREO',
+    sampleRate: track.sampleRate || 44100,
+    bitDepth: track.bitDepth || 16,
+    quality: qualityTier,
+    audioQuality: qualityTier,
+    tier: qualityTier,
+    streamQuality: isAtmos ? 'Dolby Atmos' : (track.quality || qualityTier),
+    description: track.quality,
   });
 });
 
@@ -1813,11 +1903,12 @@ app.get('/', (req, res) => {
 
 // ── Server & Telegram Initialization ──────────────────────────────────────
 
-async function resolveChannel() {
-  console.log(`Resolving channel "${CHANNEL}"...`);
+async function resolveChannel(channelInput = CHANNEL) {
+  if (!channelInput) return null;
+  console.log(`Resolving channel "${channelInput}"...`);
   // Calling getDialogs populates Telegram entity cache with access hashes for private channels
   const dialogs = await client.getDialogs({ limit: 100 });
-  const cleanInput = CHANNEL.trim();
+  const cleanInput = String(channelInput).trim();
   const stripped = cleanInput.replace(/^-100/, '').replace(/^@/, '').toLowerCase();
 
   for (const d of dialogs) {
@@ -1939,8 +2030,9 @@ async function startBotCallbackPoller(botToken) {
     await client.connect();
     console.log('Connected to Telegram!');
 
-    channelEntity = await resolveChannel();
+    channelEntity = await resolveChannel(CHANNEL);
     console.log(`Using Telegram channel: ${channelEntity.title || channelEntity.username || CHANNEL}`);
+
     await cleanupOrphanedDuplicateNotices();
 
     const BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();

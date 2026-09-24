@@ -16,3 +16,5 @@ tasks/
 scratch/
 notification_state.json
 tracks_cache.json
+*.bak
+teledrive.js
