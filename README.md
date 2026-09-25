@@ -62,6 +62,7 @@ Send `/s`, `/song`, `#s`, or `#song` in your channel to find and download lossle
 If you want to keep two different versions of a song (such as a 16-bit FLAC alongside a 24-bit master or an acoustic version):
 - **File caption:** Include `/keep`, `#keep`, or `/ig` in the caption when uploading.
 - **Grace window:** When a new file matches an existing track, the server pauses for 15 seconds before cleaning the duplicate. Reply to that file with `/keep` to save both copies.
+- **Bot notifications:** When `TELEGRAM_BOT_TOKEN` is set, duplicate warnings and cleanup digests are posted by your bot so your personal account stays silent.
 
 ### User chatter auto-cleaner
 
@@ -70,7 +71,7 @@ The channel listener discards text, images, stickers, and spam from regular chat
 
 ## How it works
 
-1. You upload audio tracks (FLAC, ALAC, WAV, MP3, M4A, or Dolby Atmos MP4/EAC3) to your private channel.
+1. You upload audio tracks (FLAC, ALAC, WAV, MP3, M4A, or Dolby Atmos M4A/EAC3) to your private channel.
 2. The server signs into Telegram through MTProto (GramJS) with your user session, avoiding bot API upload restrictions.
 3. The server scans file headers, extracts audio metadata, and populates the in-memory search index.
 4. BitChord calls `/manifest.json`, `/search?q=...`, and `/stream/:id`.
@@ -152,7 +153,8 @@ Set these environment variables in your hosting settings:
 | `TELEGRAM_CHANNEL` | Channel handle (e.g. `@my_vault`) or numeric ID (e.g. `-1001234567890`) |
 | `PORT` | HTTP port (default `3000` or host provided) |
 | `ENABLE_CHANNEL_NOTIFICATIONS` | Set to `true` to post deduplication digests to your channel (default: `false`) |
-| `TELEGRAM_BOT_TOKEN` | Optional bot token to display real inline keyboard buttons under `/s` results |
+| `TELEGRAM_BOT_TOKEN` | Optional bot token to display inline buttons under `/s` results and route automated channel notifications/deletions through your bot |
+| `TELEDRIVE_CHANNEL` | Optional source channel handle or ID to auto-sync audio files uploaded via TeleDrive |
 | `URL_SECRET` | Optional token path prefix to restrict public access to your own devices |
 
 #### Protecting your public deployment with URL_SECRET (optional)
@@ -196,7 +198,7 @@ When `URL_SECRET` is active, all routes except `/ping` and `/icon.png` require t
 - `GET /search?q=:query&atmos=auto`: Fast in-memory track search with Atmos preference.
 - `GET /isrc/:code`: Exact track match by ISRC recording code (BitChord).
 - `GET /resolve-isrc?isrc=:code`: Exact track match by ISRC recording code (Eclipse Music).
-- `GET /stream/:id`: Stream descriptors (FLAC or E-AC-3 JOC MP4) and media URL.
+- `GET /stream/:id`: Stream descriptors (FLAC or E-AC-3 JOC M4A) and media URL.
 - `GET /audio/:id`: HTTP 206 range-enabled audio streaming.
 - `GET /artwork/:id`: Album art extracts.
 - `GET /icon.png`: Addon logo for BitChord source listings (public).

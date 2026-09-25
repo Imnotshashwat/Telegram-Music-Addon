@@ -38,6 +38,13 @@ const API_ID = parseInt(cleanEnv(process.env.TELEGRAM_API_ID), 10);
 const API_HASH = cleanEnv(process.env.TELEGRAM_API_HASH);
 let SESSION_STRING = cleanEnv(process.env.TELEGRAM_SESSION_STRING);
 const CHANNEL = cleanEnv(process.env.TELEGRAM_CHANNEL);
+// Optional local TeleDrive synchronization module (gitignored)
+let teledrive = null;
+try {
+  teledrive = require('./teledrive');
+} catch (e) {
+  // Optional local module
+}
 const PORT = process.env.PORT || 3000;
 const URL_SECRET = cleanEnv(process.env.URL_SECRET || process.env.ACCESS_TOKEN);
 const CACHE_FILE = path.join(__dirname, 'tracks_cache.json');
@@ -191,8 +198,13 @@ function loadCache() {
   try {
     if (fs.existsSync(CACHE_FILE)) {
       const data = fs.readFileSync(CACHE_FILE, 'utf-8');
-      trackIndex = JSON.parse(data);
-      for (const t of trackIndex) {
+      const rawTracks = JSON.parse(data);
+      const seenIds = new Set();
+      trackIndex = [];
+      for (const t of rawTracks) {
+        const idStr = String(t.id);
+        if (seenIds.has(idStr)) continue;
+        seenIds.add(idStr);
         if (t.artist) t.artist = formatArtistForClient(t.artist);
         if (t.format === 'eac3-joc' || t.quality === 'Dolby Atmos' || ATMOS_REGEX.test(t.title || '') || ATMOS_REGEX.test(t.fileName || '')) {
           t.isAtmos = true;
@@ -200,6 +212,7 @@ function loadCache() {
           t.audioModes = ['DOLBY_ATMOS'];
           t.audioMode = 'DOLBY_ATMOS';
         }
+        trackIndex.push(t);
       }
       console.log(`Loaded ${trackIndex.length} track(s) from cache.`);
     }
@@ -702,7 +715,7 @@ async function flushDigestNotifications() {
 
   const now = Date.now();
   try {
-    const sent = await client.sendMessage(channelEntity, { message: text, parseMode: 'html' });
+    const sent = await sendChannelMessage(text, { parseMode: 'html' });
     if (sent && sent.id) {
       notifState.sentDigests.push({
         id: sent.id,
@@ -732,12 +745,77 @@ function checkDigestSchedule() {
   }
 }
 
+/**
+ * Sends a notification message to the music channel.
+ * Prefers the Telegram Bot API so notices appear from @losslessfinderbot.
+ * Falls back to the user client (MTProto) if no bot token is configured or if the bot API fails.
+ */
+async function sendChannelMessage(text, options = {}) {
+  const token = cleanEnv(process.env.TELEGRAM_BOT_TOKEN);
+  let tgChatId = cleanEnv(process.env.TELEGRAM_CHANNEL);
+
+  if (channelEntity) {
+    try {
+      const rawPeerId = utils.getPeerId(channelEntity).toString();
+      tgChatId = rawPeerId.startsWith('-100') ? rawPeerId : `-100${rawPeerId}`;
+    } catch (_) {}
+  }
+
+  if (token && tgChatId) {
+    try {
+      const payload = {
+        chat_id: tgChatId,
+        text: text,
+      };
+
+      if (options.parseMode) {
+        payload.parse_mode = options.parseMode.toLowerCase() === 'html' ? 'HTML' : 'Markdown';
+      }
+      if (options.replyTo) {
+        payload.reply_to_message_id = parseInt(options.replyTo, 10);
+      }
+
+      const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      const data = await res.json();
+      if (data.ok && data.result) {
+        return {
+          id: data.result.message_id,
+          date: data.result.date,
+          text: data.result.text,
+        };
+      }
+      console.warn('[Bot Notification] Bot API returned error, falling back to client:', data.description);
+    } catch (err) {
+      console.warn('[Bot Notification] Bot API request failed, falling back to client:', err.message);
+    }
+  }
+
+  // Fallback: user MTProto client
+  if (channelEntity) {
+    try {
+      const gramOptions = { message: text };
+      if (options.parseMode) gramOptions.parseMode = options.parseMode;
+      if (options.replyTo) gramOptions.replyTo = parseInt(options.replyTo, 10);
+      return await client.sendMessage(channelEntity, gramOptions);
+    } catch (err) {
+      console.warn('[Channel Notification Error]:', err.message);
+      return null;
+    }
+  }
+
+  return null;
+}
+
 async function sendChannelNotification(text) {
   try {
-    if (channelEntity) {
-      await client.sendMessage(channelEntity, { message: text });
-      console.log('[Channel Notification Sent]');
-    }
+    const sent = await sendChannelMessage(text);
+    if (sent) console.log('[Channel Notification Sent]');
+    return sent;
   } catch (err) {
     console.warn('[Channel Notification Error]:', err.message);
   }
@@ -755,12 +833,36 @@ function cancelPendingDeletion(messageId) {
     clearTimeout(pending.timer);
     pendingDeletions.delete(key);
     if (pending.noticeMsgId && channelEntity) {
+      deleteMessageViaBot(pending.noticeMsgId).catch(() => {});
       deleteTelegramMessages([pending.noticeMsgId]).catch(() => {});
     }
     console.log(`[Keep Flag] Cancelled pending deletion for message ID: ${key}`);
     return pending;
   }
   return null;
+}
+
+async function deleteMessageViaBot(msgId) {
+  const token = cleanEnv(process.env.TELEGRAM_BOT_TOKEN);
+  let tgChatId = cleanEnv(process.env.TELEGRAM_CHANNEL);
+  if (channelEntity) {
+    try {
+      const rawPeerId = utils.getPeerId(channelEntity).toString();
+      tgChatId = rawPeerId.startsWith('-100') ? rawPeerId : `-100${rawPeerId}`;
+    } catch (_) {}
+  }
+  if (token && tgChatId && msgId) {
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${token}/deleteMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: tgChatId, message_id: parseInt(msgId, 10) }),
+      });
+      const data = await res.json();
+      return Boolean(data.ok && data.result);
+    } catch (_) {}
+  }
+  return false;
 }
 
 async function deleteTelegramMessages(messageIds) {
@@ -777,12 +879,13 @@ async function deleteTelegramMessages(messageIds) {
     return true;
   } catch (err) {
     console.warn(`[Delete Messages Error] IDs ${JSON.stringify(messageIds)}:`, err.message);
-    // Fallback: try deleting individually if batch failed
+    // Fallback: try deleting individually with bot deleteMessage secondary fallback
     for (const rawId of messageIds) {
       const singleId = typeof rawId === 'number' ? rawId : parseInt(rawId, 10);
       if (singleId && !isNaN(singleId) && singleId > 0) {
-        await client.deleteMessages(channelEntity, [singleId], { revoke: true }).catch((e) => {
+        await client.deleteMessages(channelEntity, [singleId], { revoke: true }).catch(async (e) => {
           console.warn(`[Delete Message Fallback Error] ID ${singleId}:`, e.message);
+          await deleteMessageViaBot(singleId);
         });
       }
     }
@@ -821,6 +924,13 @@ function queueUploadedTrackLog(track) {
 }
 
 async function processTrackUpload(newTrack) {
+  if (!newTrack || !newTrack.id) return null;
+
+  // Prevent duplicate processing if this exact Telegram message is already indexed
+  if (trackIndex.some((t) => String(t.id) === String(newTrack.id))) {
+    return null;
+  }
+
   // If track is explicitly flagged to keep, index it and skip duplicate deletion
   if (newTrack.keep) {
     trackIndex.unshift(newTrack);
@@ -875,11 +985,11 @@ async function processTrackUpload(newTrack) {
     let noticeMsg = null;
     if (channelEntity) {
       const noticeText = isLower
-        ? `**Duplicate detected:** Lower quality (${describeTrackQuality(newTrack)}) than existing copy (${describeTrackQuality(existingDup)}). Deleting in 15s... (Send \`/keep\` to save)`
-        : `**Duplicate detected:** Identical copy already in library. Deleting in 15s... (Send \`/keep\` to save)`;
+        ? `<b>Duplicate detected:</b> Lower quality (${describeTrackQuality(newTrack)}) than existing copy (${describeTrackQuality(existingDup)}). Deleting in 15s... (Send <code>/keep</code> to save)`
+        : `<b>Duplicate detected:</b> Identical copy already in library. Deleting in 15s... (Send <code>/keep</code> to save)`;
 
-      noticeMsg = await client.sendMessage(channelEntity, {
-        message: noticeText,
+      noticeMsg = await sendChannelMessage(noticeText, {
+        parseMode: 'html',
         replyTo: parseInt(newTrack.id, 10),
       }).catch(() => null);
     }
@@ -888,7 +998,10 @@ async function processTrackUpload(newTrack) {
       pendingDeletions.delete(String(newTrack.id));
       console.log(`[Grace Period Expired] Deleting duplicate track: "${newTrack.title}" (ID: ${newTrack.id})`);
       const msgsToDelete = [newTrack.id];
-      if (noticeMsg && noticeMsg.id) msgsToDelete.push(noticeMsg.id);
+      if (noticeMsg && noticeMsg.id) {
+        deleteMessageViaBot(noticeMsg.id).catch(() => {});
+        msgsToDelete.push(noticeMsg.id);
+      }
       await deleteTelegramMessages(msgsToDelete);
 
       queueDuplicateNotification({
@@ -1934,7 +2047,7 @@ async function resolveChannel(channelInput = CHANNEL) {
   return await client.getEntity(cleanInput);
 }
 
-const SYSTEM_PREFIXES = ['Searching for', '🎧', '🔍', '⏳', '🚀', '✅', '❌', 'ℹ️', '🧹', '⚠️', 'Duplicate detected', '**Duplicate detected'];
+const SYSTEM_PREFIXES = ['Searching for', '🎧', '🔍', '⏳', '🚀', '✅', '❌', 'ℹ️', '🧹', '⚠️', 'Duplicate detected', '**Duplicate detected', '<b>Duplicate detected'];
 
 async function cleanupOrphanedDuplicateNotices() {
   if (!channelEntity) return;
@@ -2032,6 +2145,10 @@ async function startBotCallbackPoller(botToken) {
 
     channelEntity = await resolveChannel(CHANNEL);
     console.log(`Using Telegram channel: ${channelEntity.title || channelEntity.username || CHANNEL}`);
+
+    if (teledrive) {
+      await teledrive.initTeleDrive(client, channelEntity, resolveChannel);
+    }
 
     await cleanupOrphanedDuplicateNotices();
 
@@ -2131,11 +2248,13 @@ async function startBotCallbackPoller(botToken) {
                 trackIndex.unshift(cancelled.track);
                 saveCache();
                 console.log(`[Keep Flag] Preserved duplicate track "${cancelled.track.title}" (msg ID: ${targetKey}) via keep command.`);
-                const confirmMsg = await client.sendMessage(channelEntity, {
-                  message: `✅ **Preserved:** "${cancelled.track.title}" will be kept in your library.`
-                }).catch(() => null);
+                const confirmMsg = await sendChannelMessage(
+                  `✅ <b>Preserved:</b> "${cancelled.track.title}" will be kept in your library.`,
+                  { parseMode: 'html' }
+                ).catch(() => null);
                 if (confirmMsg) {
                   setTimeout(() => {
+                    deleteMessageViaBot(confirmMsg.id).catch(() => {});
                     client.deleteMessages(channelEntity, [confirmMsg.id, message.id], { revoke: true }).catch(() => {});
                   }, 12000);
                 }
@@ -2152,6 +2271,15 @@ async function startBotCallbackPoller(botToken) {
         // Handle incoming audio uploads
         const doc = message.media?.document;
         if (doc && isAudioDocument(doc)) {
+          if (teledrive) {
+            const handled = await teledrive.handleTeleDriveUpload(message, client, channelEntity, {
+              isAudioDocument,
+              parseTrackMessage,
+              processTrackUpload,
+            });
+            if (handled) return;
+          }
+
           if (!isMusicChannel) return;
 
           const track = await parseTrackMessage(message);
@@ -2205,6 +2333,15 @@ async function startBotCallbackPoller(botToken) {
       }
       try {
         await buildTrackIndex();
+        if (teledrive) {
+          await teledrive.syncTeleDriveExistingTracks(client, channelEntity, {
+            isAudioDocument,
+            parseTrackMessage,
+            isDuplicate,
+            trackIndex,
+            processTrackUpload,
+          });
+        }
         checkDigestSchedule();
       } catch (err) {
         console.error('Initial indexing error:', err.message);
