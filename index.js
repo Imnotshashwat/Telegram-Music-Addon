@@ -181,7 +181,7 @@ class SimpleLRU {
   }
 }
 
-const mediaCache = new SimpleLRU(1000);
+const mediaCache = new SimpleLRU(10000);
 const fastStartCache = new SimpleLRU(10);
 const FAST_START_BYTES = 512 * 1024;
 
@@ -238,9 +238,10 @@ async function getMediaForTrack(trackId) {
   }
   try {
     const messages = await client.getMessages(channelEntity, { ids: [parseInt(trackId, 10)] });
-    if (messages && messages[0] && messages[0].media) {
-      mediaCache.set(key, messages[0].media);
-      return messages[0].media;
+    const targetMsg = messages && messages.find((m) => m && String(m.id) === key);
+    if (targetMsg && targetMsg.media) {
+      mediaCache.set(key, targetMsg.media);
+      return targetMsg.media;
     }
   } catch (err) {
     console.error(`Failed to fetch media for track ${trackId}:`, err.message);
@@ -342,10 +343,13 @@ async function prewarmTrackPreamble(trackId, media, title) {
   }
 }
 
-async function parseTrackMessage(msg) {
+async function parseTrackMessage(msg, cacheMedia = true) {
   if (!msg.media || !msg.media.document) return null;
 
-  mediaCache.set(String(msg.id), msg.media);
+  // Strictly only cache media belonging to the Music Library channel
+  if (cacheMedia && channelEntity && msg.peerId && utils.getPeerId(msg.peerId).toString() === utils.getPeerId(channelEntity).toString()) {
+    mediaCache.set(String(msg.id), msg.media);
+  }
 
   const doc = msg.media.document;
   const fileName = getFileNameFromMessage(msg);
@@ -523,7 +527,7 @@ function normalizeTitle(t) {
     .toLowerCase()
     .replace(/\((?:from|official|audio|video|lyrics|full song|remastered|hd|hq|club mix|feat\.?|ft\.?|radio edit|clean|explicit|atmos|dolby\s*atmos).*?\)/gi, '')
     .replace(/\[(?:from|official|audio|video|lyrics|full song|remastered|hd|hq|club mix|feat\.?|ft\.?|radio edit|clean|explicit|atmos|dolby\s*atmos).*?\]/gi, '')
-    .replace(/\s*[-–—]\s*(?:radio edit|original mix|single|clean|explicit|atmos|dolby\s*atmos|from\s+.*?)$/gi, '')
+    .replace(/\s*[-–—]\s*(?:radio edit|original mix|single|clean|explicit|atmos|dolby\s*atmos|new version|version|lofi|remix|acoustic|live|slowed|reverb|edit|revisited|unplugged|from\s+.*?)$/gi, '')
     .replace(/[^\w\s]/gi, '')
     .replace(/\s+/g, ' ')
     .trim();
@@ -1087,6 +1091,7 @@ let isIndexing = false;
 async function buildTrackIndex() {
   if (isIndexing) return;
   isIndexing = true;
+  fastStartCache.clear();
   try {
     const newIndex = [];
     const seenIds = new Set();
@@ -1294,12 +1299,14 @@ app.get('/notifications/flush', async (req, res) => {
 const ARTIST_SEPARATORS_REGEX = /\s*(?:[,&/;·|]|\band\b|\bx\b|\bvs\.?\b|\bfeat\.?\b|\bft\.?\b|\bfeaturing\b|\bwith\b)\s*/i;
 const BRACKETED_REGEX = /[([][^()[\]]*[)\]]/g;
 const NOISE_WORDS_REGEX = /\b(?:official|video|audio|lyrics|lyric|lyrical|song|songs|full|hd|hq|4k|mp3|flac|ost|soundtrack|remaster|remastered|atmos|dolby)\b/gi;
+const VERSION_SUFFIX_REGEX = /\s+[-–—]+\s+(?:new version|version|lofi|remix|acoustic|live|slowed|reverb|edit|revisited|unplugged|original mix|extended mix|deluxe).*$/gi;
 
 function extractCoreTitle(title) {
   if (!title) return '';
   let clean = title.toLowerCase();
   clean = clean.replace(BRACKETED_REGEX, ' ');
   clean = clean.replace(NOISE_WORDS_REGEX, ' ');
+  clean = clean.replace(VERSION_SUFFIX_REGEX, ' ');
   clean = clean.replace(/[^\p{L}\p{N}\s]/gu, ' ');
   return clean.replace(/\s+/g, ' ').trim();
 }
@@ -1997,9 +2004,19 @@ app.get('/debug/faststart', (req, res) => {
     fastStartCacheSize: fastStartCache.size,
     fastStartCapacity: 10,
     mediaCacheSize: mediaCache.size,
-    mediaCacheCapacity: 1000,
+    mediaCacheCapacity: 10000,
     totalTracksInLibrary: trackIndex.length,
     cachedTracks,
+  });
+});
+
+// Clear Fast-Start RAM cache endpoint
+app.get('/debug/faststart/clear', (req, res) => {
+  fastStartCache.clear();
+  res.json({
+    status: 'ok',
+    message: 'fastStartCache cleared successfully',
+    fastStartCacheSize: fastStartCache.size,
   });
 });
 
