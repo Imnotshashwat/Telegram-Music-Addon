@@ -61,7 +61,7 @@ Send `/s`, `/song`, `#s`, or `#song` in your channel to find and download lossle
 
 If you want to keep two different versions of a song (such as a 16-bit FLAC alongside a 24-bit master or an acoustic version):
 - **File caption:** Include `/keep`, `#keep`, or `/ig` in the caption when uploading.
-- **Grace window:** When a new file matches an existing track, the server pauses for 15 seconds before cleaning the duplicate. Reply to that file with `/keep` to save both copies.
+- **Grace window:** When a new file matches an existing track, the server pauses for 30 seconds before cleaning the duplicate. Reply to that file with `/keep` to save both copies.
 - **Bot notifications:** When `TELEGRAM_BOT_TOKEN` is set, duplicate warnings and cleanup digests are posted by your bot so your personal account stays silent.
 
 ### User chatter auto-cleaner
