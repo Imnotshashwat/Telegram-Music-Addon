@@ -2,10 +2,12 @@
 
 Self-hosted [BitChord](https://github.com/kushagrasinghx/BitChord) addon that streams your personal FLAC, Dolby Atmos, and hi-res audio library from a private Telegram channel, using GramJS and Express.
 
-<video src="docs/demo.mp4" controls="controls" width="100%"></video>
+<div align="center">
+  <video src="https://github.com/user-attachments/assets/9d0392ee-9f12-4ce2-a0e1-e096690b74a8" controls="controls" width="80%"></video>
+</div>
 
 <details>
-<summary><b>View Terminal Logs from Demo Video</b></summary>
+<summary align="center"><b>View Terminal Logs from Demo Video</b></summary>
 
 ```text
 16:52:08 |  SEARCH  | "sexyback justin timberlake" (2 hits, 10ms) -> ID: 792
@@ -105,8 +107,8 @@ For Windows users who want a single file without running any commands:
 For users who already cloned the repo or extracted the ZIP:
 
 1. **Start the setup wizard:**
-   - **Windows:** Double-click `setup.bat` (runs `npm install` automatically if needed)
-   - **Mac / Linux:** Run `npm start`
+   - **Windows:** Double-click `install.bat`, then `start.bat`
+   - **Mac / Linux:** Run `npm install && npm start`
 2. Your browser opens to `http://localhost:3000/setup` automatically. On first run with no configuration, the server opens it on its own. On Mac/Linux, if it does not open, navigate there manually.
 3. Follow the 4 steps:
    - **Step 1 (Telegram):** Enter your Telegram `API_ID`, `API_HASH`, and phone number (from [my.telegram.org](https://my.telegram.org)).
