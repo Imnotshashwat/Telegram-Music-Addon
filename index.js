@@ -618,7 +618,7 @@ async function parseTrackMessage(msg, cacheMedia = true) {
   let bitrate = undefined;
 
   const isMp4Container = ext === 'm4a' || ext === 'mp4';
-  const shouldSniffTags = (isMp4Container || !audioAttr || !audioAttr.title || !audioAttr.performer || !isrc) && sizeBytes > 0;
+  const shouldSniffTags = (isMp4Container || !audioAttr || (!audioAttr.title && !audioAttr.performer)) && sizeBytes > 0;
   let parsedCodec = null;
   let hasEc3Atom = false;
   let hasAlacAtom = false;
@@ -1463,6 +1463,10 @@ async function buildTrackIndex() {
       }
 
       batchCount++;
+      if (batchCount % 25 === 0) {
+        trackIndex = newIndex;
+        saveCache();
+      }
     }
 
     trackIndex = newIndex;
@@ -2392,8 +2396,8 @@ async function streamAudioTrack(trackId, req, res) {
       }
     }
 
-    const isAudition = (start === 0 && bytesNeeded <= 128 * 1024);
-    const isPlaybackStart = (start === 0 && bytesNeeded > 128 * 1024);
+    const isAudition = (start === 0 && bytesNeeded < 64 * 1024);
+    const isPlaybackStart = (start === 0 && bytesNeeded >= 64 * 1024);
 
     const durStr = formatTrackDuration(track.duration);
     const durPart = durStr ? `${durStr}, ` : '';
@@ -2407,7 +2411,7 @@ async function streamAudioTrack(trackId, req, res) {
     let hasLoggedPlayback = false;
     const maybeLogPlayback = (deliveredBytes) => {
       if (hasLoggedPlayback || !isPlaybackStart) return;
-      if (deliveredBytes < Math.min(256 * 1024, bytesNeeded)) return;
+      if (deliveredBytes < Math.min(64 * 1024, bytesNeeded)) return;
       hasLoggedPlayback = true;
       const now = Date.now();
       if (currentlyPlayingTrackId !== track.id || (now - lastPlaybackLogTime > 4000)) {
