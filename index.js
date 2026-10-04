@@ -3093,9 +3093,7 @@ async function startTelegramService() {
     }
 
     await client.connect();
-    logCli('TELEGRAM', `Connected to MTProto session`);
-
-    const currentChannel = CHANNEL || cleanEnv(process.env.TELEGRAM_CHANNEL) || env.TELEGRAM_CHANNEL;
+    const currentChannel = cleanEnv(process.env.TELEGRAM_CHANNEL) || env.TELEGRAM_CHANNEL || CHANNEL;
     channelEntity = await resolveChannel(currentChannel);
     if (!channelEntity) {
       logCli('CHANNEL', `Could not access or find channel: ${BOLD}"${currentChannel}"${RESET}. Check permissions or channel ID.`);
@@ -3327,6 +3325,11 @@ function printUrlBanner(label, urlStr) {
 
       setupApi.setOnConfigSaved(async (updates) => {
         console.log('[Setup] New configuration received. Initializing Telegram service...');
+        for (const [k, v] of Object.entries(updates)) {
+          if (v !== undefined && v !== null) {
+            process.env[k] = v;
+          }
+        }
         if (updates.URL_SECRET !== undefined) {
           process.env.URL_SECRET = updates.URL_SECRET;
         }
