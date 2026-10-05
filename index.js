@@ -1437,7 +1437,7 @@ async function buildTrackIndex() {
     const seenIds = new Set();
     let batchCount = 0;
 
-    for await (const msg of client.iterMessages(channelEntity, { limit: 5000, waitTime: 0 })) {
+    for await (const msg of client.iterMessages(channelEntity, { waitTime: 0 })) {
       const msgIdStr = String(msg.id);
       if (seenIds.has(msgIdStr)) continue;
       seenIds.add(msgIdStr);
