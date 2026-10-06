@@ -64,6 +64,7 @@ try {
   // Optional local module
 }
 const PORT = process.env.PORT || 3000;
+const CLEANUP_DUPLICATES_ON_STARTUP = process.env.CLEANUP_DUPLICATES_ON_STARTUP === 'true';
 function getUrlSecret() {
   return cleanEnv(process.env.URL_SECRET || process.env.ACCESS_TOKEN);
 }
@@ -3111,7 +3112,9 @@ async function startTelegramService() {
       await teledrive.initTeleDrive(client, channelEntity, resolveChannel);
     }
 
-    await cleanupOrphanedDuplicateNotices();
+    if (CLEANUP_DUPLICATES_ON_STARTUP) {
+      await cleanupOrphanedDuplicateNotices();
+    }
 
     // Set up real-time listener for audio uploads, /keep flag, and auto-purge cleaner
     client.addEventHandler(async (event) => {
